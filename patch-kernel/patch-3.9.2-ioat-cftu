@@ -1,0 +1,2613 @@
+diff -NaubrB linux-3.9.2/arch/x86/include/asm/uaccess_64.h linux-3.9.2.2/arch/x86/include/asm/uaccess_64.h
+--- linux-3.9.2/arch/x86/include/asm/uaccess_64.h	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/arch/x86/include/asm/uaccess_64.h	2013-12-12 16:16:10.944093000 +0100
+@@ -11,6 +11,24 @@
+ #include <asm/cpufeature.h>
+ #include <asm/page.h>
+ 
++#ifdef CONFIG_TRACE_COPY_TO_FROM_X86_64
++	#include <asm/smp.h>
++	#include <linux/circular_buffer.h>
++	#include <asm/barrier.h>
++	#include <linux/sched.h>
++	#include <linux/types.h>
++	#include <linux/percpu.h>
++
++	extern struct CircularBuffer mem_buff_to ;
++	extern struct CircularBuffer mem_buff_from ;
++	extern struct CircularBuffer __mem_buff_to ;
++	extern struct CircularBuffer __mem_buff_from ;
++#endif
++
++#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++	#include <linux/dmaengine.h>
++#endif
++
+ /*
+  * Copy To/From Userspace
+  */
+@@ -52,33 +70,33 @@
+ __must_check unsigned long
+ copy_in_user(void __user *to, const void __user *from, unsigned len);
+ 
+-static inline unsigned long __must_check copy_from_user(void *to,
++/*start:  functions not measured*/	
++	static inline unsigned long __must_check copy_from_user_pure(void *to,
+ 					  const void __user *from,
+ 					  unsigned long n)
+-{
++	{
+ 	int sz = __compiletime_object_size(to);
+ 
+ 	might_fault();
+ 	if (likely(sz == -1 || sz >= n))
+ 		n = _copy_from_user(to, from, n);
+-#ifdef CONFIG_DEBUG_VM
++	#ifdef CONFIG_DEBUG_VM
+ 	else
+ 		WARN(1, "Buffer overflow detected!\n");
+-#endif
++	#endif
+ 	return n;
+-}
++	}
+ 
+-static __always_inline __must_check
+-int copy_to_user(void __user *dst, const void *src, unsigned size)
+-{
++	static __always_inline __must_check
++	int copy_to_user_pure(void __user *dst, const void *src, unsigned size)
++	{
+ 	might_fault();
+-
+ 	return _copy_to_user(dst, src, size);
+-}
++	}
+ 
+-static __always_inline __must_check
+-int __copy_from_user(void *dst, const void __user *src, unsigned size)
+-{
++	static __always_inline __must_check
++	int __copy_from_user_pure(void *dst, const void __user *src, unsigned size)
++	{
+ 	int ret = 0;
+ 
+ 	might_fault();
+@@ -118,11 +136,11 @@
+ 	default:
+ 		return copy_user_generic(dst, (__force void *)src, size);
+ 	}
+-}
++	}
+ 
+-static __always_inline __must_check
+-int __copy_to_user(void __user *dst, const void *src, unsigned size)
+-{
++	static __always_inline __must_check
++	int __copy_to_user_pure(void __user *dst, const void *src, unsigned size)
++	{
+ 	int ret = 0;
+ 
+ 	might_fault();
+@@ -162,7 +180,345 @@
+ 	default:
+ 		return copy_user_generic((__force void *)dst, src, size);
+ 	}
+-}
++	}	
++	
++#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++	static inline unsigned long __must_check copy_from_user_dma_pure(void *to,
++							const void __user *from,
++							unsigned long n)
++	{
++		int r ;
++		struct request_copy req_cpy_local;
++		init_req_copy(&req_cpy_local , (void *) from, to , (size_t) n);
++		r = dma_copy_from_user(&req_cpy_local);
++		if(r < 0 || req_cpy_local.status != DMA_SUCCESS)
++		{
++			goto error_dma;		
++		}
++			
++		return r;
++		
++	error_dma:
++		r = copy_from_user_pure(to, from, n);	
++		return r;
++	}
++
++	static __always_inline __must_check
++	int copy_to_user_dma_pure(void __user *dst, const void *src, unsigned size)
++	{
++		int r;
++	  struct request_copy req_cpy_local;
++		init_req_copy(&req_cpy_local , dst , (void *)src , (size_t) size);
++		r = dma_copy_to_user(&req_cpy_local);
++		if(r < 0 ||req_cpy_local.status != DMA_SUCCESS)
++		{
++				goto error_dma;		
++		}
++			
++		return r;
++		
++	error_dma:
++		r = copy_to_user_pure(dst, src, size);	
++		return r;
++	}
++
++	static __always_inline __must_check
++	int __copy_from_user_dma_pure(void *dst, const void __user *src, unsigned size)
++	{
++		int ret = 0;
++
++	  struct request_copy req_cpy_local;
++		init_req_copy(&req_cpy_local , (void *) src, dst, (size_t) size);
++		ret = dma_copy_from_user(&req_cpy_local);		
++		if(ret < 0 ||req_cpy_local.status != DMA_SUCCESS)
++		{
++				goto error_dma;		
++		}	
++		
++		return ret;
++	
++	error_dma:
++		ret = __copy_from_user_pure(dst, src, size);		
++		return ret;
++	}
++
++	static __always_inline __must_check
++	int __copy_to_user_dma_pure(void __user *dst, const void *src, unsigned size)
++	{
++		int ret = 0;
++
++	  struct request_copy req_cpy_local;
++		init_req_copy(&req_cpy_local , dst, (void *) src , (size_t) size);
++		ret = dma_copy_to_user(&req_cpy_local);
++		if(ret < 0 ||req_cpy_local.status != DMA_SUCCESS)
++		{
++				goto error_dma;		
++		}	
++		
++		return ret;
++	
++	error_dma:
++		ret = __copy_to_user_pure(dst, src, size);		
++		return ret;
++	}
++#endif
++/* end functions not measured*/	
++
++#ifdef CONFIG_TRACE_COPY_TO_FROM_X86_64
++
++	static inline unsigned long __must_check copy_from_user(void *to,
++					  const void __user *from,
++					  unsigned long n)
++	{
++		struct CircularBuffer *ptr;
++		struct unit_buff unit;
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++	  struct request_copy req_cpy_local;
++	  
++		init_req_copy(&req_cpy_local , (void *) from, to , (size_t) n);
++		unit.type_op = OP_COPY_DMA;
++	#endif
++		
++		unit.addr = __builtin_return_address(0);
++		unit.size  = n;
++
++		unit.index_cpu = smp_processor_id();	
++		
++				
++		mb() ;	
++		unit.clock_cpu_start = cpu_clock(unit.index_cpu);
++		mb() ;
++		
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++		n = dma_copy_from_user(&req_cpy_local);
++		if(n < 0 || req_cpy_local.status != DMA_SUCCESS)
++		{
++			unit.type_op = OP_COPY_CPU;
++			n = req_cpy_local.len;
++			n = copy_from_user_pure(to, from, n);		
++		}
++	#else		
++		unit.type_op = OP_COPY_CPU;
++		n = copy_from_user_pure(to, from, n);
++	#endif 
++	
++		mb() ;
++		unit.clock_cpu_end = cpu_clock(unit.index_cpu);
++		mb() ;	
++		
++		unit.size  = unit.size - n;
++		
++		unit.index_cpu_event = get_cpu();
++		ptr = &per_cpu(mem_buff_from , unit.index_cpu_event );
++		unit.count_event =  get_counter(ptr);
++		cbWrite(ptr, &unit);
++		put_cpu();
++		
++		return n;
++	}
++
++	static __always_inline __must_check
++	int copy_to_user(void __user *dst, const void *src, unsigned size)
++	{
++		int r;
++		struct CircularBuffer *ptr;
++		struct unit_buff unit;
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++	  struct request_copy req_cpy_local;
++	  
++	  init_req_copy(&req_cpy_local , dst , (void *)src , (size_t) size);
++		unit.type_op = OP_COPY_DMA;
++	#endif
++		
++		unit.addr = __builtin_return_address(0);
++		
++		unit.index_cpu = smp_processor_id();
++				
++		mb() ;	
++		unit.clock_cpu_start = cpu_clock(unit.index_cpu);
++		mb() ;
++		
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++		r = dma_copy_to_user(&req_cpy_local);
++		if(r < 0 ||req_cpy_local.status != DMA_SUCCESS)
++		{
++			unit.type_op = OP_COPY_CPU;
++			r = copy_to_user_pure(dst, src, size);		
++		}
++	#else		
++		unit.type_op = OP_COPY_CPU;
++		r = copy_to_user_pure(dst, src, size);	
++	#endif	
++	
++		mb() ;
++		unit.clock_cpu_end = cpu_clock(unit.index_cpu);
++		mb() ;	
++		
++		unit.size  = size - r;
++		
++		unit.index_cpu_event = get_cpu();
++		ptr = &per_cpu(mem_buff_to , unit.index_cpu_event);
++		unit.count_event =  get_counter(ptr);
++		cbWrite(ptr, &unit);
++		put_cpu();
++				
++		return r ;
++	}
++	
++	static __always_inline __must_check
++	int __copy_from_user(void *dst, const void __user *src, unsigned size)
++	{
++		struct CircularBuffer *ptr;
++		struct unit_buff unit;
++		int ret = 0;
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++	  struct request_copy req_cpy_local;
++	  
++	  init_req_copy(&req_cpy_local , (void *) src, dst, (size_t) size);
++		unit.type_op = OP_COPY_DMA;
++	#endif	
++	
++		unit.size = size;
++		unit.addr = __builtin_return_address(0);
++		
++		unit.index_cpu = smp_processor_id();
++				
++		/* start measure */
++		mb() ;	
++		unit.clock_cpu_start = cpu_clock(unit.index_cpu);
++		mb() ;
++
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++		ret = dma_copy_from_user(&req_cpy_local);
++		if(ret < 0 ||req_cpy_local.status != DMA_SUCCESS)
++		{
++			unit.type_op = OP_COPY_CPU;
++			ret = __copy_from_user_pure(dst, src, size);	
++		}	
++	#else
++		unit.type_op = OP_COPY_CPU;
++		ret = __copy_from_user_pure(dst, src, size);	
++	#endif
++		
++		mb() ;
++		unit.clock_cpu_end = cpu_clock(unit.index_cpu);
++		mb() ;	
++		unit.size  = unit.size - ret;
++		unit.index_cpu_event = get_cpu();
++		ptr = &per_cpu(__mem_buff_from , unit.index_cpu_event );
++		unit.count_event =  get_counter(ptr);
++		cbWrite(ptr, &unit);
++		put_cpu();
++		/* end measure */
++		
++		return ret;
++	}
++
++	static __always_inline __must_check
++	int __copy_to_user(void __user *dst, const void *src, unsigned size)
++	{
++		struct CircularBuffer *ptr;
++		struct unit_buff unit;
++		int ret = 0;
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++	  struct request_copy req_cpy_local;
++	  
++	  init_req_copy(&req_cpy_local , dst, (void *) src , (size_t) size);
++		unit.type_op = OP_COPY_DMA;
++	#endif
++	
++		unit.size = size;
++		unit.addr = __builtin_return_address(0);
++		
++		unit.index_cpu = smp_processor_id();
++				
++		/* start measure */
++		mb() ;	
++		unit.clock_cpu_start = cpu_clock(unit.index_cpu);
++		mb() ;
++		
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++		ret = dma_copy_to_user(&req_cpy_local);
++		if(ret < 0 ||req_cpy_local.status != DMA_SUCCESS)
++		{
++			unit.type_op = OP_COPY_CPU;
++			ret = __copy_to_user_pure(dst, src, size);	
++		}
++	#else 
++		unit.type_op = OP_COPY_CPU;
++		ret = __copy_to_user_pure(dst, src, size);	
++	#endif
++
++		mb() ;
++		unit.clock_cpu_end = cpu_clock(unit.index_cpu);
++		mb() ;	
++		unit.size  = unit.size - ret;
++		unit.index_cpu_event = get_cpu();
++		ptr = &per_cpu(__mem_buff_to , unit.index_cpu_event);
++		unit.count_event =  get_counter(ptr);
++		cbWrite(ptr, &unit);
++		put_cpu();
++		/* end measure */
++
++		return ret;
++	}
++	
++#else  /*CONFIG_TRACE_COPY_TO_FROM_X86_64*/
++	static inline unsigned long __must_check copy_from_user(void *to,
++							const void __user *from,
++							unsigned long n)
++	{
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++			n = copy_from_user_dma_pure(to, from, n);
++		#else		
++			n = copy_from_user_pure(to, from, n);
++		#endif 
++			
++		return n;
++	}
++
++	static __always_inline __must_check
++	int copy_to_user(void __user *dst, const void *src, unsigned size)
++	{
++		int r;
++
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++		r = copy_to_user_dma_pure(dst, src, size);	
++	#else		
++		r = copy_to_user_pure(dst, src, size);	
++	#endif	
++
++		return r ;
++	}
++
++	static __always_inline __must_check
++	int __copy_from_user(void *dst, const void __user *src, unsigned size)
++	{
++		int ret = 0;
++
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++		ret = __copy_from_user_dma_pure(dst, src, size);	
++	#else	
++		ret = __copy_from_user_pure(dst, src, size);	
++	#endif 
++		
++		return ret;
++	}
++
++	static __always_inline __must_check
++	int __copy_to_user(void __user *dst, const void *src, unsigned size)
++	{
++		int ret = 0;
++
++	#if defined(CONFIG_SHARED_COPY_TO_FROM_IOATDMA) || defined(CONFIG_EXCL_COPY_TO_FROM_IOATDMA)
++		ret = __copy_to_user_dma_pure(dst, src, size);	
++	#else
++		ret = __copy_to_user_pure(dst, src, size);	
++	#endif 
++
++		return ret;
++	}
++#endif /*CONFIG_TRACE_COPY_TO_FROM_X86_64*/
+ 
+ static __always_inline __must_check
+ int __copy_in_user(void __user *dst, const void __user *src, unsigned size)
+diff -NaubrB linux-3.9.2/arch/x86/Kconfig.debug linux-3.9.2.2/arch/x86/Kconfig.debug
+--- linux-3.9.2/arch/x86/Kconfig.debug	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/arch/x86/Kconfig.debug	2013-10-23 12:12:54.996118000 +0200
+@@ -30,6 +30,48 @@
+ 	  (e.g. bzImage) of the boot. If you disable this you will still
+ 	  see errors. Disable this if you want silent bootup.
+ 
++config TRACE_COPY_TO_FROM_X86_64
++	bool "Trace copy_to_user, copy_from_user"
++	depends on X86_64
++	---help---
++	  Provides to trace functions: copy_to_user, copy_from_user. 
++	  If unsure say 'N'.
++
++config MEM_MICRO_BENCHMARK
++	bool "Micro-Benchmark memory region at boot time"
++	depends on X86_64
++	---help---
++		Provides to acquire a dedicated buffer at boot time.
++		If unsure say 'N'.
++
++choice
++	prompt "Size Micro-Benchmark memory region at boot time"
++	default MEM_MICRO_BENCHMARK_32
++	depends on MEM_MICRO_BENCHMARK
++	help
++	  This option allows you to choose the size of the Micro-Benchmark 
++	  memory region at boot time.
++	  
++config  MEM_MICRO_BENCHMARK_32
++	  bool "32 MB"
++	  
++config  MEM_MICRO_BENCHMARK_64
++	  bool "64 MB"
++
++config  MEM_MICRO_BENCHMARK_128
++	  bool "128 MB"
++	  
++config  MEM_MICRO_BENCHMARK_256
++	  bool "256 MB"
++
++config  MEM_MICRO_BENCHMARK_512
++	  bool "512 MB"
++
++config  MEM_MICRO_BENCHMARK_1024
++	  bool "1024 MB"
++
++endchoice
++
+ config EARLY_PRINTK
+ 	bool "Early printk" if EXPERT
+ 	default y
+diff -NaubrB linux-3.9.2/drivers/dma/dmaengine.c linux-3.9.2.2/drivers/dma/dmaengine.c
+--- linux-3.9.2/drivers/dma/dmaengine.c	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/drivers/dma/dmaengine.c	2013-12-17 17:28:06.708942000 +0100
+@@ -68,7 +68,12 @@
+ static DEFINE_IDR(dma_idr);
+ static LIST_HEAD(dma_device_list);
+ static long dmaengine_ref_count;
++static long copy_dmaengine_ref_count; /* reference counter for copy DMA */
+ 
++#ifdef CONFIG_POLICY_IOATDMA 
++	extern struct dma_chan_copy percpu_chan_copy;
++	extern struct list_dma_chan_prio list_chan_prio;
++#endif
+ /* --- sysfs implementation --- */
+ 
+ /**
+@@ -352,6 +357,108 @@
+ }
+ EXPORT_SYMBOL(net_dma_find_channel);
+ 
++/* init the reference counter for copy DMA */
++void init_copy_dmaengine_ref_count(void)
++{
++		copy_dmaengine_ref_count = 0;
++}
++
++#ifdef CONFIG_POLICY_IOATDMA
++/**
++ * dma_get_channel_prio - retun a priority channel, has 
++ * alignment requirements.
++ * @priority: the request priority 
++ */
++struct dma_chan *copy_dma_get_channel_prio(unsigned short int priority)
++{
++	uint i;
++	struct dma_chan *chan;
++	chan = NULL;
++	
++	for(i = 0; i < list_chan_prio.size ; ++i) 
++	{	
++		if(list_chan_prio.priority[i] == priority)
++		{
++			chan = list_chan_prio.chan_prio[i];
++			break;
++		}
++	}
++	
++	if (chan && !is_dma_copy_aligned(chan->device, 1, 1, 1))
++		return NULL;
++
++	return chan;
++}
++EXPORT_SYMBOL(copy_dma_get_channel_prio);
++
++/**
++ * copy_dma_get_channel_sh - retun a shared channel, has 
++ * alignment requirements
++ */
++struct dma_chan *copy_dma_get_channel_sh(void)
++{
++	struct dma_chan *chan;
++	chan = NULL;
++
++	if(copy_dmaengine_ref_count > 0)
++	{
++		chan = dma_find_channel(DMA_MEMCPY);
++	}
++
++	if (chan && !is_dma_copy_aligned(chan->device, 1, 1, 1))
++		return NULL;
++
++	return chan;
++}
++EXPORT_SYMBOL(copy_dma_get_channel_sh);
++	
++/**
++ * copy_dma_get_channel_excl - retun a exclusive channel, has 
++ * alignment requirements
++ */
++struct dma_chan *copy_dma_get_channel_excl(void)
++{
++	struct dma_chan *chan;
++	chan = NULL;
++	
++	chan = get_cpu_var(percpu_chan_copy).chan;
++	put_cpu_var(percpu_chan_copy);
++
++	if (chan && !is_dma_copy_aligned(chan->device, 1, 1, 1))
++		return NULL;
++
++	return chan;
++}
++EXPORT_SYMBOL(copy_dma_get_channel_excl);
++
++/**
++ * copy_dma_get_channel_boot - return a channel for the  
++ * DMA copy_to/from_user
++ */
++struct dma_chan *copy_dma_get_channel_boot(void)
++{
++	struct dma_chan *chan;
++	chan = NULL;
++	
++#ifdef CONFIG_EXCL_COPY_TO_FROM_IOATDMA
++	chan = get_cpu_var(percpu_chan_copy).chan;
++	put_cpu_var(percpu_chan_copy);
++#endif
++
++#ifdef CONFIG_SHARED_COPY_TO_FROM_IOATDMA
++	if(copy_dmaengine_ref_count > 0)
++	{
++		chan = dma_find_channel(DMA_MEMCPY);
++	}
++#endif
++
++	if (chan && !is_dma_copy_aligned(chan->device, 1, 1, 1))
++		return NULL;
++
++	return chan;
++}
++#endif /* CONFIG_POLICY_IOATDMA */
++
+ /**
+  * dma_issue_pending_all - flush all pending operations across all channels
+  */
+@@ -638,6 +745,33 @@
+ }
+ EXPORT_SYMBOL(dmaengine_put);
+ 
++/**
++ * copy_dmaengine_get - register interest in dma_channels of the 
++ * copy DMA
++ */
++void copy_dmaengine_get(void)
++{
++	dmaengine_get();
++	mb();
++	mutex_lock(&dma_list_mutex);
++		copy_dmaengine_ref_count++;
++	mutex_unlock(&dma_list_mutex);
++}
++
++/**
++ * copy_dmaengine_put - let dma drivers be removed when ref_count == 0 and 
++ * decrease the reference counter for DMA copy
++ */
++void copy_dmaengine_put(void)
++{
++	dmaengine_put();
++	mb();
++	mutex_lock(&dma_list_mutex);
++		copy_dmaengine_ref_count--;
++	mutex_unlock(&dma_list_mutex);
++}
++
++
+ static bool device_has_all_tx_types(struct dma_device *device)
+ {
+ 	/* A device that satisfies this test has channels that will never cause
+@@ -962,6 +1096,75 @@
+ EXPORT_SYMBOL(dma_async_memcpy_buf_to_pg);
+ 
+ /**
++ * dma_async_memcpy_pg_to_buf - offloaded copy from page to address
++ * @chan: DMA channel to offload copy to
++ * @page: source page
++ * @offset: offset in page to copy from
++ * @kdata: destination address (virtual)
++ * @len: length
++ *
++ * Both @page/@offset and @kdata must be mappable to a bus address according
++ * to the DMA mapping API rules for streaming mappings.
++ * Both @page/@offset and @kdata must stay memory resident (kernel memory or
++ * locked user space pages)
++ */
++dma_cookie_t
++dma_async_memcpy_pg_to_buf(struct dma_chan *chan, struct page *page,
++			unsigned int offset, void *kdata, size_t len)
++{
++	struct dma_device *dev = chan->device;
++	struct dma_async_tx_descriptor *tx;
++	dma_addr_t dma_dest, dma_src;
++	dma_cookie_t cookie;
++	unsigned long flags;
++	int ret;
++
++	dma_dest = dma_map_single(dev->dev, kdata, len, DMA_FROM_DEVICE);
++	if(!dma_dest)
++	{
++		ret = -EFAULT;
++		goto err_map_single;
++	}
++	
++	dma_src = dma_map_page(dev->dev, page, offset, len, DMA_TO_DEVICE);
++	if(!dma_src)
++	{
++		ret = -EFAULT;
++		goto err_map_page;
++	}
++	
++	flags = DMA_CTRL_ACK | DMA_COMPL_DEST_UNMAP_SINGLE;
++	tx = dev->device_prep_dma_memcpy(chan, dma_dest, dma_src, len, flags);
++
++	if(!tx) 
++	{
++		ret = -ENOMEM;
++		goto err_prep_dma_memcpy;
++	}
++
++	tx->callback = NULL;
++	cookie = tx->tx_submit(tx);
++
++	/* for statistics */
++	preempt_disable();
++	__this_cpu_add(chan->local->bytes_transferred, len);
++	__this_cpu_inc(chan->local->memcpy_count);
++	preempt_enable();
++
++	return cookie;
++	
++err_prep_dma_memcpy:	
++		dma_unmap_page(dev->dev, dma_src, len, DMA_TO_DEVICE);
++
++err_map_page:	
++		dma_unmap_single(dev->dev, dma_dest, len, DMA_FROM_DEVICE);
++		
++err_map_single:
++		return ret;
++}
++EXPORT_SYMBOL(dma_async_memcpy_pg_to_buf);
++
++/**
+  * dma_async_memcpy_pg_to_pg - offloaded copy from page to page
+  * @chan: DMA channel to offload copy to
+  * @dest_pg: destination page
+diff -NaubrB linux-3.9.2/drivers/dma/dma_policy_ex_sh.c linux-3.9.2.2/drivers/dma/dma_policy_ex_sh.c
+--- linux-3.9.2/drivers/dma/dma_policy_ex_sh.c	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.2/drivers/dma/dma_policy_ex_sh.c	2013-12-18 15:29:51.719616000 +0100
+@@ -0,0 +1,477 @@
++#include <linux/dmaengine.h>
++#include <linux/pagemap.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/memcontrol.h>
++#include <linux/percpu.h>
++
++#ifdef CONFIG_POLICY_IOATDMA
++
++	#ifdef CONFIG_EXCL_COPY_TO_FROM_IOATDMA
++		extern struct dma_chan_copy percpu_chan_copy;
++	#else /* CONFIG_EXCL_COPY_TO_FROM_IOATDMA */
++		DEFINE_PER_CPU(struct dma_chan_copy , percpu_chan_copy);
++		EXPORT_PER_CPU_SYMBOL(percpu_chan_copy);
++	#endif /* CONFIG_EXCL_COPY_TO_FROM_IOATDMA */
++	
++#endif /* CONFIG_POLICY_IOATDMA */
++
++/* relase exclusive channels */
++static void release_dma_chan_excl(void)
++{ 
++  uint i;
++	struct dma_chan_copy *cpu_chan;
++
++	for_each_present_cpu(i) 
++	{
++		cpu_chan = &per_cpu(percpu_chan_copy , i);
++		
++		if(cpu_chan->use == 1)
++		{
++			dma_release_channel(cpu_chan->chan);
++			cpu_chan->chan = NULL;
++			cpu_chan->use = 0;
++		} 
++	}
++}
++
++/* init available exclusive channels */
++static void init_dma_chan_excl(void)
++{ 
++	uint i;
++	struct dma_chan_copy *cpu_chan;
++
++	for_each_present_cpu(i) 
++	{
++		cpu_chan = &per_cpu(percpu_chan_copy , i);
++		cpu_chan->use = 0;
++		cpu_chan->chan = NULL;
++	}
++}
++
++/* make available exclusive channels */
++static int complete_dma_chan_excl(void)
++{
++	uint i;
++	dma_cap_mask_t mask;
++	struct dma_chan *chan;
++	struct dma_chan_copy *cpu_chan;
++	
++	dma_cap_zero(mask);
++	dma_cap_set(DMA_MEMCPY, mask);
++	
++	for_each_present_cpu(i) 
++	{
++		cpu_chan = &per_cpu(percpu_chan_copy , i);
++		chan = dma_request_channel(mask, NULL , NULL);
++
++		if(chan)
++		{
++			cpu_chan->use = 1;
++			cpu_chan->chan = chan;
++		} 
++		else
++		{
++			release_dma_chan_excl();
++			printk(KERN_WARNING "ioat: WARNING no DMA chan alloc (exclusive chan policy)\n");
++			return -1;
++		}
++	}
++	printk(KERN_DEBUG "ioat: DMA chan alloc (exclusive chan policy)\n");
++	return 0;
++}
++
++/* start exclusive dynamic policy */
++int start_policy_excl(void)
++{
++	init_dma_chan_excl();
++	return complete_dma_chan_excl();
++}
++EXPORT_SYMBOL(start_policy_excl);
++
++/* stop exclusive dynamic policy */
++void stop_policy_excl(void)
++{
++	release_dma_chan_excl();
++	printk(KERN_DEBUG "ioat: DMA chan remove (exclusive chan policy)\n");
++}
++EXPORT_SYMBOL(stop_policy_excl);
++
++/* start shared dynamic policy */
++void start_policy_sh(void)
++{
++	copy_dmaengine_get();
++	printk(KERN_DEBUG "ioat: DMA chan alloc (shared chan policy)\n");
++}
++EXPORT_SYMBOL(start_policy_sh);
++
++/* stop shared dynamic policy */
++void stop_policy_sh(void)
++{
++	copy_dmaengine_put();
++	printk(KERN_DEBUG "ioat: DMA chan remove (shared chan policy)\n");
++}
++EXPORT_SYMBOL(stop_policy_sh);
++
++static int __dma_copy_from_user(struct request_copy *req_cpy_local)
++{
++	int byte_offset;
++	int copy;
++	int page_index;
++	void __kernel  *tmp_addr_kernel;
++	void __user *tmp_addr_user;
++	size_t tmp_len;
++	
++	tmp_addr_kernel = req_cpy_local->kernel_base;
++	tmp_addr_user = req_cpy_local->user_base;
++	tmp_len = req_cpy_local->len;
++
++	byte_offset = ((unsigned long)req_cpy_local->user_base & ~PAGE_MASK);
++	page_index = 0 ;
++	
++	copy = min_t(int, PAGE_SIZE - byte_offset, tmp_len);
++
++	/* break up copies to not cross page boundary */
++	while(1)
++	{		
++		req_cpy_local->dma_cookie = dma_async_memcpy_pg_to_buf(req_cpy_local->chan, 
++			req_cpy_local->pages[page_index], byte_offset ,tmp_addr_kernel, copy);
++		
++		/* poll for a descriptor slot */
++		if (unlikely(req_cpy_local->dma_cookie < 0)) 
++		{
++			dma_async_issue_pending(req_cpy_local->chan);
++			continue;	
++		}
++		
++		tmp_len -= copy;
++		
++		if(!tmp_len)
++			goto end_copy;
++		
++		tmp_addr_user += copy;
++		tmp_addr_kernel += copy;
++		byte_offset = 0;
++		page_index++;
++		copy = min_t(int, PAGE_SIZE, tmp_len);
++	}
++	
++end_copy:
++	req_cpy_local->status = dma_sync_wait(req_cpy_local->chan, req_cpy_local->dma_cookie);
++
++	return tmp_len;
++}
++
++/** 
++ * copy_from_user with DMA engine without pin/unpin (dynamic shared policy)
++ * return: 0 for sucessfull, negative for error  
++ * and positive for byte again to copy 
++ * */ 
++ int _dma_copy_from_user_sh(struct request_copy *req_cpy_local)
++{	
++	if( req_cpy_local->len > 0)
++	{	
++		req_cpy_local->chan = copy_dma_get_channel_sh();	
++	
++		if (req_cpy_local->chan == NULL )
++		{
++			return -EBUSY;
++		}
++	
++		return __dma_copy_from_user(req_cpy_local);
++	}
++	
++	return 0;
++}
++EXPORT_SYMBOL(_dma_copy_from_user_sh);
++
++/** 
++ * copy_from_user with DMA engine without pin/unpin (dynamic exclusive policy)
++ * return: 0 for sucessfull, negative for error  
++ * and positive for byte again to copy 
++ * */ 
++ int _dma_copy_from_user_excl(struct request_copy *req_cpy_local)
++{	
++	if( req_cpy_local->len > 0)
++	{	
++		req_cpy_local->chan = copy_dma_get_channel_excl();	
++	
++		if (req_cpy_local->chan == NULL )
++		{
++			return -EBUSY;
++		}
++	
++		return __dma_copy_from_user(req_cpy_local);
++	}
++	
++	return 0;
++}
++EXPORT_SYMBOL(_dma_copy_from_user_excl);
++ 
++static int __dma_copy_to_user(struct request_copy *req_cpy_local)
++{
++	int byte_offset;
++	int copy;
++	int page_index;
++	void __kernel  *tmp_addr_kernel;
++	void __user *tmp_addr_user;
++	size_t tmp_len;
++	
++	tmp_addr_kernel = req_cpy_local->kernel_base;
++	tmp_addr_user = req_cpy_local->user_base;
++	tmp_len = req_cpy_local->len;
++
++	byte_offset = ((unsigned long)req_cpy_local->user_base & ~PAGE_MASK);
++	page_index = 0 ;
++	
++	copy = min_t(int, PAGE_SIZE - byte_offset, tmp_len);
++
++	/* break up copies to not cross page boundary */
++	while(1)
++	{				
++		req_cpy_local->dma_cookie = dma_async_memcpy_buf_to_pg(req_cpy_local->chan, 
++			req_cpy_local->pages[page_index], byte_offset ,tmp_addr_kernel, copy);
++
++		/* poll for a descriptor slot */
++		if (unlikely(req_cpy_local->dma_cookie < 0)) 
++		{
++			dma_async_issue_pending(req_cpy_local->chan);
++			continue;	
++		}
++		
++		tmp_len -= copy;
++		if(!tmp_len)
++			goto end_copy;
++		
++		tmp_addr_user += copy;
++		tmp_addr_kernel += copy;
++		byte_offset = 0;
++		page_index++;
++		copy = min_t(int, PAGE_SIZE, tmp_len);
++	}
++
++end_copy:	
++	req_cpy_local->status = dma_sync_wait(req_cpy_local->chan, req_cpy_local->dma_cookie);
++
++	return tmp_len;
++}
++
++/** 
++ * copy_to_user with DMA engine without pin/unpin (dynamic shared policy)
++ * return: 0 for sucessfull, negative for error 
++ * and positive for byte again to copy
++ */ 
++int _dma_copy_to_user_sh(struct request_copy *req_cpy_local)
++{	
++	if( req_cpy_local->len > 0)
++	{	
++		req_cpy_local->chan = copy_dma_get_channel_sh();	
++		
++		if (req_cpy_local->chan == NULL )
++			return -EBUSY;
++
++		return __dma_copy_to_user(req_cpy_local);
++	}
++	
++	return 0;
++}
++EXPORT_SYMBOL(_dma_copy_to_user_sh);
++
++/** 
++ * copy_to_user with DMA engine without pin/unpin (dynamic exclusive policy)
++ * return: 0 for sucessfull, negative for error 
++ * and positive for byte again to copy
++ */ 
++int _dma_copy_to_user_excl(struct request_copy *req_cpy_local)
++{	
++	if( req_cpy_local->len > 0)
++	{	
++		req_cpy_local->chan = copy_dma_get_channel_excl();	
++		
++		if (req_cpy_local->chan == NULL )
++			return -EBUSY;
++
++		return __dma_copy_to_user(req_cpy_local);
++	}
++	
++	return 0;
++}
++EXPORT_SYMBOL(_dma_copy_to_user_excl);
++
++/*
++ * Pin down all the user pages needed for req_cp->len bytes.
++*/
++int dma_pin_user_pages(struct request_copy *req_cp , int write , int force)
++{
++	int ret;
++
++	/* don't pin down non-user-address */
++	if (segment_eq(get_fs(), KERNEL_DS))
++		return PIN_NO_USER;
++
++	/* determine how many pages there are, up front */
++	req_cp->nr_pages = ((PAGE_ALIGN((unsigned long)req_cp->user_base + req_cp->len) - 
++		((unsigned long)req_cp->user_base  & PAGE_MASK)) >> PAGE_SHIFT);
++
++	/* single kmalloc for pinned list, page_list[], and the page arrays */
++	req_cp->pages = kmalloc((sizeof(struct page*) * req_cp->nr_pages), GFP_KERNEL);
++	if (!req_cp->pages)
++		goto out;
++
++	if (!access_ok(VERIFY_WRITE, req_cp->user_base, req_cp->len) && write)
++		goto unpin;
++	
++	if (!access_ok(VERIFY_READ, req_cp->user_base, req_cp->len) && !write)
++		goto unpin;
++
++	/* pin pages down */
++	down_read(&current->mm->mmap_sem);
++	ret = get_user_pages( current, current->mm , (unsigned long) req_cp->user_base, req_cp->nr_pages,
++			write ,	/* write */  force,	/* force */	req_cp->pages,	NULL);
++	up_read(&current->mm->mmap_sem);
++
++	if (ret != req_cp->nr_pages)
++		goto unpin;
++
++	return PIN_SUCCESSFUL;
++
++unpin:
++	dma_unpin_user_pages(req_cp , SET_DIRTY_OFF);
++out:
++	return PIN_FAILED;
++}
++EXPORT_SYMBOL(dma_pin_user_pages);
++
++/*
++ * Pin up all the user pages in the req_cp->pages.
++*/
++void dma_unpin_user_pages(struct request_copy *req_cp , int dirty)
++{
++	int i ;
++	if( req_cp->pages != NULL )
++	{
++		for (i = 0; (i < req_cp->nr_pages) && req_cp->pages[i] != NULL ; i++) 
++		{
++			if(dirty)
++			set_page_dirty_lock(req_cp->pages[i]);
++			
++			page_cache_release(req_cp->pages[i]);
++		}
++		
++		kfree(req_cp->pages);
++	}
++}
++EXPORT_SYMBOL(dma_unpin_user_pages);
++
++/* 
++ * copy memory in kernel space with DMA engine
++ * return: 0 for sucessfull, check status for error 
++ */ 
++int dma_copy_from_kernel(struct request_copy *req_cpy_local)
++{
++	while(1)
++	{
++		req_cpy_local->dma_cookie = dma_async_memcpy_buf_to_buf(req_cpy_local->chan, 
++									req_cpy_local->kernel_base, req_cpy_local->user_base, req_cpy_local->len);
++									
++		if(unlikely(req_cpy_local->dma_cookie < 0)) 
++			dma_async_issue_pending(req_cpy_local->chan);	
++		else
++			goto dma_cookie_ok;	
++	}		
++
++dma_cookie_ok:
++	req_cpy_local->status = dma_sync_wait(req_cpy_local->chan, req_cpy_local->dma_cookie);
++	return 0;
++}
++
++/* 
++ * copy memory in kernel space with DMA engine
++ * return: 0 for sucessfull, check status for error 
++ */ 
++int dma_copy_to_kernel(struct request_copy *req_cpy_local)
++{
++	while(1)
++	{
++		req_cpy_local->dma_cookie = dma_async_memcpy_buf_to_buf(req_cpy_local->chan, 
++									  req_cpy_local->user_base ,req_cpy_local->kernel_base, req_cpy_local->len);
++									
++		if(unlikely(req_cpy_local->dma_cookie < 0)) 
++			dma_async_issue_pending(req_cpy_local->chan);	
++		else
++			goto dma_cookie_ok;
++	}
++
++dma_cookie_ok:
++	req_cpy_local->status = dma_sync_wait(req_cpy_local->chan, req_cpy_local->dma_cookie);
++	return 0;
++}
++
++/** 
++ * copy_to_user with DMA engine (for copy in uaccess_64.h)
++ * return: 0 for sucessfull , negative for error 
++ * and positive for byte again to copy
++ */ 
++int dma_copy_to_user(struct request_copy *req_cpy_local)
++{
++	int ret = 0;
++	
++	if( req_cpy_local->len > 0)
++	{	
++		req_cpy_local->chan = copy_dma_get_channel_boot();	
++	
++		if (req_cpy_local->chan == NULL )
++			return -EBUSY;
++
++		ret = dma_pin_user_pages(req_cpy_local , PIN_WRITE , 0) ;
++		
++		if( ret == PIN_FAILED)
++			return req_cpy_local->len; 
++	
++		if( ret == PIN_NO_USER )
++		{
++			return dma_copy_to_kernel(req_cpy_local);
++		}
++		
++		ret = __dma_copy_to_user(req_cpy_local);
++		
++		dma_unpin_user_pages(req_cpy_local , SET_DIRTY_ON);
++	}
++	
++	return ret;
++}
++EXPORT_SYMBOL(dma_copy_to_user);
++
++/** 
++ * copy_from_user with DMA engine (for copy in uaccess_64.h)
++ * return: 0 for sucessfull, negative for error  
++ * and positive for byte again to copy 
++ * */ 
++ int dma_copy_from_user(struct request_copy *req_cpy_local)
++{
++	int ret = 0;
++	
++	if( req_cpy_local->len > 0)
++	{	
++		req_cpy_local->chan = copy_dma_get_channel_boot();	
++	
++		if (req_cpy_local->chan == NULL )
++			return -EBUSY;
++
++		ret = dma_pin_user_pages(req_cpy_local , PIN_READ , 0);
++		
++		if( ret == PIN_FAILED)
++			return req_cpy_local->len; 
++	
++		if( ret == PIN_NO_USER )
++			return dma_copy_from_kernel(req_cpy_local);
++		
++		ret = __dma_copy_from_user(req_cpy_local);
++		
++		dma_unpin_user_pages(req_cpy_local , SET_DIRTY_OFF);			
++	}
++	
++	return ret;
++}
++EXPORT_SYMBOL(dma_copy_from_user);
+diff -NaubrB linux-3.9.2/drivers/dma/dma_policy_prio.c linux-3.9.2.2/drivers/dma/dma_policy_prio.c
+--- linux-3.9.2/drivers/dma/dma_policy_prio.c	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.2/drivers/dma/dma_policy_prio.c	2013-12-18 15:28:56.207618000 +0100
+@@ -0,0 +1,397 @@
++#include <linux/dmaengine.h>
++#include <linux/pagemap.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/memcontrol.h>
++#include <linux/hrtimer.h>
++
++#define MAX_QUANTUM 2 
++struct list_dma_chan_prio list_chan_prio;
++EXPORT_SYMBOL(list_chan_prio);
++
++static struct priority_timer prio_timer;
++typedef void (*prio_ptr_func)(struct list_dma_chan_prio * , unsigned short int);
++
++/** 
++ * priority_timer - struct for hrtimer
++ * @list_chan: list priority channels
++ * @timer: hrtimer
++ * @tick: tick for change priority
++ * @overruns_2: number overruns > 1
++ * @quantum: time intervals of the priority
++ * @prio_func_array: functions associated with the priority
++*/ 
++struct priority_timer
++{
++	struct list_dma_chan_prio *list_chan;
++	struct hrtimer timer;
++	unsigned short int tick;
++	unsigned long overruns_2;
++	ktime_t quantum[MAX_QUANTUM];
++	prio_ptr_func prio_func_array[MAX_QUANTUM];
++};
++
++/* relase priority channels */
++static void release_dma_chan_prio(void)
++{
++	uint i;
++	for(i = 0; i < list_chan_prio.size ; ++i) 
++	{	
++		dma_release_channel(list_chan_prio.chan_prio[i]);
++		list_chan_prio.chan_prio[i] = NULL;
++	}
++	list_chan_prio.size = 0;
++}
++
++/* init available priority channels */
++static void init_dma_chan_prio(void)
++{
++	uint i;
++
++	list_chan_prio.size = 0;
++	for(i = 0; i < DMA_MAX_CHAN_PRIO ; ++i) 
++	{
++		list_chan_prio.chan_prio[i] = NULL;
++		list_chan_prio.priority[i] = DMA_LOW_PRIO;
++	}
++}
++
++/* make available priority channels */
++static int complete_dma_chan_prio(void)
++{
++	uint i;
++	dma_cap_mask_t mask;
++	
++	dma_cap_zero(mask);
++	dma_cap_set(DMA_MEMCPY, mask);
++	
++	for(i = 0; i < DMA_MAX_CHAN_PRIO ; ++i) 
++	{
++	
++		list_chan_prio.chan_prio[i] = dma_request_channel(mask, NULL , NULL);
++
++		if(list_chan_prio.chan_prio[i])
++		{
++			++list_chan_prio.size;
++		} 
++		else
++		{
++			release_dma_chan_prio();
++			printk(KERN_WARNING "ioat: WARNING no DMA chan alloc (priority chan policy)\n");
++			return -1;
++		}
++	}	
++
++	printk(KERN_DEBUG "ioat: DMA chan alloc (priority chan policy)\n");
++	return 0;
++}
++
++/**
++ * resume_chan_prio - resume the DMA channels
++ * @list_prio: list priority channels
++ * @priority: resume the channels that have the priority < @priority
++ * Warning: priority 0 >  priority 1
++*/ 
++static void resume_chan_prio(struct list_dma_chan_prio *list_prio , unsigned short int priority)
++{
++	int i;
++	for ( i = 0 ; i < list_prio->size ; ++i)
++	{
++		if(list_prio->priority[i] > priority)
++		{
++			ioat_resume_chan(list_prio->chan_prio[i]);
++		}
++		
++	}
++}
++
++/**
++ * suspend_chan_prio - suspend the DMA channels
++ * @list_prio: list priority channels
++ * @priority: suspend the channels that have the priority < @priority
++ * Warning: priority 0 >  priority 1
++*/ 
++static void supend_chan_prio(struct list_dma_chan_prio *list_prio , unsigned short int priority)
++{
++	int i;
++	for ( i = 0 ; i < list_prio->size  ; ++i)
++	{
++		if(list_prio->priority[i] > priority)
++		{
++			ioat_suspend_chan(list_prio->chan_prio[i]);
++		}
++	}
++} 
++ 
++/* callback hrtimer */
++static enum hrtimer_restart prio_hrtimer_callback(struct hrtimer *timer)
++{
++ struct priority_timer *prio;
++ u64 ret;
++ 
++ prio = container_of(timer, struct priority_timer , timer);
++ 
++ prio->tick = prio->tick % MAX_QUANTUM;
++ prio->prio_func_array[prio->tick](prio->list_chan , DMA_HIGH_PRIO);
++ 
++ ret = hrtimer_forward_now(timer, prio->quantum[prio->tick]);
++ ++prio->tick;
++ 
++ if(ret > 1)
++	++prio->overruns_2;
++ 
++ return HRTIMER_RESTART;
++}       
++
++/**
++ * start_policy_prio2 - start the priority dynamic policy with two quantum.
++ * @nanosecs_high: high priority quantum 
++ * @nanosecs_low: low priority quantum 
++ * return: the number of channels allocated or negative number for error
++ */
++int start_policy_prio2(long nanosecs_high , long nanosecs_low)
++{
++	int  i;
++	unsigned short int priority;
++	
++	init_dma_chan_prio();
++	
++	if(complete_dma_chan_prio() < 0)
++		goto no_prio_channel;
++	
++	priority = DMA_HIGH_PRIO;
++	for(i = 0; i < list_chan_prio.size ; ++i) 
++	{
++		list_chan_prio.priority[i] = priority;
++		++priority;
++	}
++	
++	prio_timer.list_chan = &list_chan_prio;
++	prio_timer.tick = (unsigned long long) MAX_QUANTUM;
++	prio_timer.overruns_2 = 0;
++	prio_timer.quantum[0] = ktime_set( 0 , nanosecs_high);
++	prio_timer.quantum[1] = ktime_set( 0 , nanosecs_low);
++	prio_timer.prio_func_array[0] = supend_chan_prio;
++	prio_timer.prio_func_array[1] = resume_chan_prio;
++	
++	hrtimer_init(&prio_timer.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	prio_timer.timer.function = prio_hrtimer_callback;
++	
++	hrtimer_start(&prio_timer.timer, prio_timer.quantum[0] , HRTIMER_MODE_REL);
++	
++	return list_chan_prio.size;
++	
++no_prio_channel:
++	return -1;
++}
++EXPORT_SYMBOL(start_policy_prio2);
++
++/* stop priority dynamic policy */
++void stop_policy_prio(void)
++{
++  hrtimer_cancel(&prio_timer.timer);
++  resume_chan_prio(&list_chan_prio , DMA_HIGH_PRIO);
++  prio_timer.list_chan = NULL;
++  prio_timer.tick = 0;
++  release_dma_chan_prio();
++  printk(KERN_DEBUG "ioat: DMA chan remove (priority chan policy)\n");
++	printk(KERN_DEBUG "ioat: overruns > 1: %lu \n" , prio_timer.overruns_2);
++}
++EXPORT_SYMBOL(stop_policy_prio);
++
++int __dma_copy_from_user_prio(struct request_copy_prio *req_cpy_local)
++{
++	int byte_offset;
++	int copy;
++	int page_index;
++	void __kernel  *tmp_addr_kernel;
++	void __user *tmp_addr_user;
++	size_t tmp_len;
++	
++	tmp_addr_kernel = req_cpy_local->kernel_base;
++	tmp_addr_user = req_cpy_local->user_base;
++	tmp_len = req_cpy_local->len;
++
++	byte_offset = ((unsigned long)req_cpy_local->user_base & ~PAGE_MASK);
++	page_index = 0 ;
++	
++	copy = min_t(int, PAGE_SIZE - byte_offset, tmp_len);
++
++	/* break up copies to not cross page boundary */
++	while(1)
++	{		
++		req_cpy_local->dma_cookie = dma_async_memcpy_pg_to_buf(req_cpy_local->chan, 
++			req_cpy_local->pages[page_index], byte_offset ,tmp_addr_kernel, copy);
++		
++		/* poll for a descriptor slot */
++		if (unlikely(req_cpy_local->dma_cookie < 0)) 
++		{
++			dma_async_issue_pending(req_cpy_local->chan);
++			continue;	
++		}
++		
++		tmp_len -= copy;
++		if(!tmp_len)
++			goto end_copy;
++		
++		tmp_addr_user += copy;
++		tmp_addr_kernel += copy;
++		byte_offset = 0;
++		page_index++;
++		copy = min_t(int, PAGE_SIZE, tmp_len);
++	}
++
++end_copy:
++	req_cpy_local->status = dma_sync_wait(req_cpy_local->chan, req_cpy_local->dma_cookie);
++
++	return tmp_len;
++}
++EXPORT_SYMBOL(__dma_copy_from_user_prio);
++
++/** 
++ * copy_from_user with DMA engine without pin/unpin (dynamic priority policy)
++ * return: 0 for sucessfull, negative for error  
++ * and positive for byte again to copy 
++ * */ 
++int _dma_copy_from_user_prio(struct request_copy_prio *req_cpy_local)
++{
++	if( req_cpy_local->len > 0)
++	{	
++		req_cpy_local->chan = copy_dma_get_channel_prio(req_cpy_local->priority);	
++	
++		if (req_cpy_local->chan == NULL )
++		{
++			return -EBUSY;
++		}
++		return  __dma_copy_from_user_prio(req_cpy_local);
++	}
++	return 0;
++}
++EXPORT_SYMBOL(_dma_copy_from_user_prio);
++
++
++
++int __dma_copy_to_user_prio(struct request_copy_prio *req_cpy_local)
++{
++	int byte_offset;
++	int copy;
++	int page_index;
++	void __kernel  *tmp_addr_kernel;
++	void __user *tmp_addr_user;
++	size_t tmp_len;
++
++	tmp_addr_kernel = req_cpy_local->kernel_base;
++	tmp_addr_user = req_cpy_local->user_base;
++	tmp_len = req_cpy_local->len;
++
++	byte_offset = ((unsigned long)req_cpy_local->user_base & ~PAGE_MASK);
++	page_index = 0 ;
++	
++	copy = min_t(int, PAGE_SIZE - byte_offset, tmp_len);
++
++	/* break up copies to not cross page boundary */
++	while(1)
++	{				
++		req_cpy_local->dma_cookie = dma_async_memcpy_buf_to_pg(req_cpy_local->chan, 
++			req_cpy_local->pages[page_index], byte_offset ,tmp_addr_kernel, copy);
++
++		/* poll for a descriptor slot */
++		if (unlikely(req_cpy_local->dma_cookie < 0)) 
++		{
++			dma_async_issue_pending(req_cpy_local->chan);
++			continue;	
++		}
++		
++		tmp_len -= copy;
++		if(!tmp_len)
++			goto end_copy;
++		
++		tmp_addr_user += copy;
++		tmp_addr_kernel += copy;
++		byte_offset = 0;
++		page_index++;
++		copy = min_t(int, PAGE_SIZE, tmp_len);
++	}
++
++end_copy:
++	req_cpy_local->status = dma_sync_wait(req_cpy_local->chan, req_cpy_local->dma_cookie);
++
++	return tmp_len;
++}
++EXPORT_SYMBOL(__dma_copy_to_user_prio);
++
++/** 
++ * copy_to_user with DMA engine without pin/unpin (dynamic priority policy)
++ * return: 0 for sucessfull, negative for error 
++ * and positive for byte again to copy
++ */ 
++int _dma_copy_to_user_prio(struct request_copy_prio *req_cpy_local)
++{
++ 	if( req_cpy_local->len > 0)
++	{	
++		req_cpy_local->chan = copy_dma_get_channel_prio(req_cpy_local->priority);	
++		
++		if (req_cpy_local->chan == NULL )
++			return -EBUSY;
++			
++		return __dma_copy_to_user_prio(req_cpy_local);
++	}
++	return 0;
++}
++EXPORT_SYMBOL(_dma_copy_to_user_prio);
++
++
++/*
++ * Pin down all the user pages needed for req_cp->len bytes.
++*/
++int dma_pin_user_pages_prio(struct request_copy_prio *req_cp , int write , int force)
++{
++	int ret;
++
++	/* determine how many pages there are, up front */
++	req_cp->nr_pages = ((PAGE_ALIGN((unsigned long)req_cp->user_base + req_cp->len) - 
++		((unsigned long)req_cp->user_base  & PAGE_MASK)) >> PAGE_SHIFT);
++
++	/* single kmalloc for pinned list, page_list[], and the page arrays */
++	req_cp->pages = kmalloc((sizeof(struct page*) * req_cp->nr_pages), GFP_KERNEL);
++	if (!req_cp->pages)
++		goto out;
++
++	/* pin pages down */
++	down_read(&current->mm->mmap_sem);
++	ret = get_user_pages( current, current->mm , (unsigned long) req_cp->user_base, req_cp->nr_pages,
++			write ,	/* write */  force,	/* force */	req_cp->pages,	NULL);
++	up_read(&current->mm->mmap_sem);
++
++	if (ret != req_cp->nr_pages)
++		goto unpin;
++
++	return PIN_SUCCESSFUL;
++
++unpin:
++	dma_unpin_user_pages_prio(req_cp , SET_DIRTY_OFF);
++out:
++	return PIN_FAILED;
++}
++EXPORT_SYMBOL(dma_pin_user_pages_prio);
++
++/*
++ * Pin up all the user pages in the req_cp->pages.
++*/
++void dma_unpin_user_pages_prio(struct request_copy_prio *req_cp , int dirty)
++{
++	int i ;
++	if( req_cp->pages != NULL )
++	{
++		for (i = 0; (i < req_cp->nr_pages) && req_cp->pages[i] != NULL ; i++) 
++		{
++			if(dirty)
++			set_page_dirty_lock(req_cp->pages[i]);
++			
++			page_cache_release(req_cp->pages[i]);
++		}
++		kfree(req_cp->pages);
++	}
++}
++EXPORT_SYMBOL(dma_unpin_user_pages_prio);
+diff -NaubrB linux-3.9.2/drivers/dma/ioat/dca.c linux-3.9.2.2/drivers/dma/ioat/dca.c
+--- linux-3.9.2/drivers/dma/ioat/dca.c	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/drivers/dma/ioat/dca.c	2013-09-27 13:09:49.480322000 +0200
+@@ -88,6 +88,7 @@
+ 	return (pci->bus->number << 8) | pci->devfn;
+ }
+ 
++#ifndef CONFIG_IOATDMA_DISABLE_DCA
+ static int dca_enabled_in_bios(struct pci_dev *pdev)
+ {
+ 	/* CPUID level 9 returns DCA configuration */
+@@ -102,14 +104,22 @@
+ 
+ 	return res;
+ }
++#endif
+ 
+ int system_has_dca_enabled(struct pci_dev *pdev)
+ {
++	#ifndef CONFIG_IOATDMA_DISABLE_DCA
+ 	if (boot_cpu_has(X86_FEATURE_DCA))
++	{
++		printk(KERN_DEBUG "ioat: DCA is enabled \n");
+ 		return dca_enabled_in_bios(pdev);
+-
++	}
+ 	dev_dbg(&pdev->dev, "boot cpu doesn't have X86_FEATURE_DCA\n");
+ 	return 0;
++	#else
++	printk(KERN_WARNING "ioat: DCA is disabled \n");
++	return 0;
++	#endif
+ }
+ 
+ struct ioat_dca_slot {
+diff -NaubrB linux-3.9.2/drivers/dma/ioat/dma.c linux-3.9.2.2/drivers/dma/ioat/dma.c
+--- linux-3.9.2/drivers/dma/ioat/dma.c	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/drivers/dma/ioat/dma.c	2013-10-21 17:39:59.934939000 +0200
+@@ -1234,3 +1234,13 @@
+ 
+ 	INIT_LIST_HEAD(&dma->channels);
+ }
++
++void ioat_suspend_chan(struct dma_chan *c)
++{
++	ioat_suspend(to_chan_common(c));
++}
++
++void ioat_resume_chan(struct dma_chan *c)
++{
++	ioat_resume(to_chan_common(c));
++}
+diff -NaubrB linux-3.9.2/drivers/dma/ioat/dma.h linux-3.9.2.2/drivers/dma/ioat/dma.h
+--- linux-3.9.2/drivers/dma/ioat/dma.h	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/drivers/dma/ioat/dma.h	2013-10-17 16:54:56.147618000 +0200
+@@ -242,6 +242,13 @@
+ 	writeb(IOAT_CHANCMD_SUSPEND, chan->reg_base + IOAT_CHANCMD_OFFSET(ver));
+ }
+ 
++static inline void ioat_resume(struct ioat_chan_common *chan)
++{
++	u8 ver = chan->device->version; 
++	
++	writeb(IOAT_CHANCMD_RESUME, chan->reg_base + IOAT_CHANCMD_OFFSET(ver));
++}
++
+ static inline void ioat_reset(struct ioat_chan_common *chan)
+ {
+ 	u8 ver = chan->device->version;
+diff -NaubrB linux-3.9.2/drivers/dma/Kconfig linux-3.9.2.2/drivers/dma/Kconfig
+--- linux-3.9.2/drivers/dma/Kconfig	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/drivers/dma/Kconfig	2013-10-21 15:36:04.063110304 +0200
+@@ -81,6 +81,49 @@
+ 	help
+ 	  Enable support for the Intel(R) IOP Series RAID engines.
+ 
++config IOATDMA_DISABLE_DCA
++	bool "disable dca in Intel I/OAT DMA"
++	depends on X86_64 && INTEL_IOATDMA
++	help
++		Say yes here if you want disable DCA in Intel I/OAT DMA.
++
++config POLICY_IOATDMA
++	bool "policy for Intel I/OAT DMA"
++	depends on X86_64 && INTEL_IOATDMA
++	help
++	 Say yes to enable a policy for Intel I/OAT DMA"
++
++choice
++	prompt "policy for Intel I/OAT DMA channel"
++	default DYNAMIC_CHAN_POLICY_IOATDMA
++	depends on POLICY_IOATDMA
++	help
++	  This option allows to select a channel allocation policy 
++	  for Intel(R) I/OAT DMA engine.
++	  
++config DYNAMIC_CHAN_POLICY_IOATDMA
++	  bool "Dynamic channel allocations"
++	  help
++	    Enable support to all policy.
++	    
++config SHARED_COPY_TO_FROM_IOATDMA
++	  bool "copy_to/from_user whit I/OAT (shared DMA channels)"
++	  help
++	  	Say yes here to use Intel(R) I/OAT DMA engine for
++			memory copy in the functions: copy_to_user() and
++			copy_from_user() with policy shared DMA channel.
++			The policy is enabled at boot system and you not change policy.
++	    
++config EXCL_COPY_TO_FROM_IOATDMA
++	  bool "copy_to/from_user whit I/OAT (exclusive DMA channels)"
++	  help
++	   	Say yes here to use Intel(R) I/OAT DMA engine for
++			memory copy in the functions: copy_to_user() and
++			copy_from_user() whit policy exclusive DMA channel.
++			The policy is enabled at boot system and you not change policy.
++
++endchoice
++
+ config DW_DMAC
+ 	tristate "Synopsys DesignWare AHB DMA support"
+ 	depends on GENERIC_HARDIRQS
+diff -NaubrB linux-3.9.2/drivers/dma/Makefile linux-3.9.2.2/drivers/dma/Makefile
+--- linux-3.9.2/drivers/dma/Makefile	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/drivers/dma/Makefile	2013-10-21 11:54:08.103079000 +0200
+@@ -6,6 +6,7 @@
+ obj-$(CONFIG_DMA_OF) += of-dma.o
+ 
+ obj-$(CONFIG_NET_DMA) += iovlock.o
++obj-$(CONFIG_POLICY_IOATDMA) += dma_policy_ex_sh.o dma_policy_prio.o
+ obj-$(CONFIG_INTEL_MID_DMAC) += intel_mid_dma.o
+ obj-$(CONFIG_DMATEST) += dmatest.o
+ obj-$(CONFIG_INTEL_IOATDMA) += ioat/
+diff -NaubrB linux-3.9.2/include/linux/circular_buffer.h linux-3.9.2.2/include/linux/circular_buffer.h
+--- linux-3.9.2/include/linux/circular_buffer.h	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.2/include/linux/circular_buffer.h	2013-10-15 17:29:06.100729000 +0200
+@@ -0,0 +1,87 @@
++#ifndef _CIRCULAR_BUFFER_H_
++#define _CIRCULAR_BUFFER_H_
++
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++
++/* hardware operation */
++#define OP_COPY_NO_DEF 0 
++#define OP_COPY_CPU 1
++#define OP_COPY_DMA 2
++
++#define CIRC_BUFF_SIZE 1024 
++
++
++/** struct unit_buff - struct to record the measurement
++ * @index_cpu_event: cpu that starts the measure 
++ * @count_event: value of counter on that cpu (index_cpu_event)
++ * @addr: return address of the current function
++ * @size: copied data (byte) from the operation 
++ * @type_op: the hardware type that runs operation
++ * @index_cpu: cpu that finishes the measure
++ * @clock_cpu_start: start measure time (ns) 
++ * @clock_cpu_end: end measure time (ns) 
++ */ 
++struct unit_buff
++{
++  unsigned short index_cpu_event;
++  unsigned long long count_event; 
++  void *addr;
++  unsigned long size;
++  unsigned short type_op;
++  unsigned short index_cpu;
++  unsigned long long clock_cpu_start;
++  unsigned long long clock_cpu_end;
++};
++ 
++/** Circular buffer struct - object for the measurement on the cpu
++ * @ count_event: counter event on that cpu
++ * @ start: index of oldest element
++ * @ end: index at which to write new element
++ * @ size: size of buffer
++ * @ array_element: set of element
++ */
++struct CircularBuffer
++{
++	long long count_event; /* contatore evento*/
++    uint         start;  /*               */
++    uint         end;    /*   */
++    uint         size;
++	struct unit_buff *array_element; /* vector of elements         */
++};
++
++/* alloc and init an instance of struct CircularBuffer */
++void cbInit(struct CircularBuffer *cb );
++
++/* check if is full, return: 1 for full, 0 for not full */
++static inline int cbIsFull(struct CircularBuffer *cb) 
++{
++    return (cb->end + 1) % cb->size == cb->start;     
++}
++ 
++/* check if is empty return: 1 for empty, 0 for not empty */
++static inline int cbIsEmpty(struct CircularBuffer *cb) 
++{
++    return cb->end == cb->start; 
++}
++ 
++/* increment counter and return its value */
++static inline long long get_counter(struct CircularBuffer *cb) 
++{
++  return ++cb->count_event;
++}
++
++/* free an instance of struct CircularBuffer */
++void cbFree(struct CircularBuffer *cb);
++ 
++/* Write an element, not overwriting oldest element if buffer is full (wine policy).  */
++void cbWrite(struct CircularBuffer *cb, struct unit_buff *elem); 
++
++/* Read oldest element and return a its copy. App must ensure !cbIsEmpty() first. */
++void cbRead(struct CircularBuffer *cb, struct unit_buff *elem);
++
++/* copy at most @size oldest element and returns the number of elements copied */
++int cbRead_list(struct CircularBuffer *cb, struct unit_buff *elem , int size);
++
++#endif /*CIRCULAR_BUFFER_H*/
+diff -NaubrB linux-3.9.2/include/linux/dmaengine.h linux-3.9.2.2/include/linux/dmaengine.h
+--- linux-3.9.2/include/linux/dmaengine.h	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/include/linux/dmaengine.h	2013-10-29 12:04:41.429622877 +0100
+@@ -38,6 +38,13 @@
+ #define DMA_MIN_COOKIE	1
+ #define DMA_MAX_COOKIE	INT_MAX
+ 
++#ifdef CONFIG_POLICY_IOATDMA
++#include <linux/rwlock.h>
++#define DMA_HIGH_PRIO 0
++#define DMA_LOW_PRIO 128
++#define DMA_MAX_CHAN_PRIO 4
++#endif
++
+ #define dma_submit_error(cookie) ((cookie) < 0 ? 1 : 0)
+ 
+ /**
+@@ -52,6 +59,7 @@
+ 	DMA_IN_PROGRESS,
+ 	DMA_PAUSED,
+ 	DMA_ERROR,
++	DMA_INIT,
+ };
+ 
+ /**
+@@ -371,6 +379,80 @@
+ 	unsigned int slave_id;
+ };
+ 
++#ifdef CONFIG_POLICY_IOATDMA
++/**
++ * struct request_copy_prio - for request copy to DMA 
++ * @dma_chan: driver channel device
++ * @priority: priority of channel (-1 not used)
++ * @user_base: user address
++ * @kernel_base: kernel address
++ * @len: size of copy in byte
++ * @pages: list of pages to pin/unpin
++ * @dma_cookie: last cookie value returned 
++ * @status: DMA transaction status
++ */
++struct request_copy_prio
++{
++	struct dma_chan *chan;
++	unsigned short int priority;
++	void __user *user_base;
++	void __kernel  *kernel_base;
++	size_t len;
++	struct page **pages;
++	int nr_pages;
++	dma_cookie_t  dma_cookie;
++	enum dma_status status;	
++};
++
++/**
++ * struct request_copy - for request copy to DMA 
++ * @chan: driver channel device
++ * @priority: priority of channel (-1 not used)
++ * @user_base: user address
++ * @kernel_base: kernel address
++ * @len: size of copy in byte
++ * @pages: list of pages to pin/unpin
++ * @dma_cookie: last cookie value returned 
++ * @status: DMA transaction status
++ */
++struct request_copy
++{
++	struct dma_chan *chan;
++	void __user *user_base;
++	void __kernel  *kernel_base;
++	size_t len;
++	struct page **pages;
++	int nr_pages;
++	dma_cookie_t  dma_cookie;
++	enum dma_status status;	
++};
++
++/**
++ * struct dma_chan_copy - for channel status
++ * @chan: driver channel device
++ * @use: 1 in use , 0 not in use.
++*/
++struct dma_chan_copy
++{
++	struct dma_chan *chan;
++	short int use;
++};
++
++/**
++ * struct list_dma_chan_prio - list of dma chan priority
++ * @chan_prio: list of dma_chan
++ * @priority: priority of channel, range type priority
++ * 		[DMA_HIGH_PRIO - DMA_LOW_PRIO].
++ * @size: @chan_prio size (in element) 
++*/
++struct list_dma_chan_prio
++{
++	struct dma_chan *chan_prio[DMA_MAX_CHAN_PRIO];
++	unsigned short int priority[DMA_MAX_CHAN_PRIO];
++	unsigned short int size;
++};
++#endif /* CONFIG_POLICY_IOATDMA */
++
+ static inline const char *dma_chan_name(struct dma_chan *chan)
+ {
+ 	return dev_name(&chan->dev->device);
+@@ -843,6 +925,8 @@
+ 	void *dest, void *src, size_t len);
+ dma_cookie_t dma_async_memcpy_buf_to_pg(struct dma_chan *chan,
+ 	struct page *page, unsigned int offset, void *kdata, size_t len);
++dma_cookie_t dma_async_memcpy_pg_to_buf(struct dma_chan *chan, 
++	struct page *page, unsigned int offset, void *kdata, size_t len);
+ dma_cookie_t dma_async_memcpy_pg_to_pg(struct dma_chan *chan,
+ 	struct page *dest_pg, unsigned int dest_off, struct page *src_pg,
+ 	unsigned int src_off, size_t len);
+@@ -894,6 +978,42 @@
+ #define for_each_dma_cap_mask(cap, mask) \
+ 	for_each_set_bit(cap, mask.bits, DMA_TX_TYPE_END)
+ 
++#ifdef CONFIG_POLICY_IOATDMA
++/**
++ * init_req_copy - init struct request_copy
++ */
++static inline void init_req_copy_prio(struct request_copy_prio *req_cp, 
++					void __user *user_b, void __kernel *kernel_b , size_t length ,
++					unsigned short int priority)
++{
++	req_cp->chan = NULL;
++	req_cp->priority = priority;
++	req_cp->user_base = user_b;
++	req_cp->kernel_base = kernel_b;
++	req_cp->len  =  length;
++	req_cp->pages = NULL;
++	req_cp->nr_pages = 0 ;
++	req_cp->dma_cookie  = 0;
++	req_cp->status = DMA_INIT;
++}
++
++/**
++ * init_req_copy - init struct request_copy
++ */
++static inline void init_req_copy(struct request_copy *req_cp, 
++					void __user *user_b, void __kernel *kernel_b  , size_t length)
++{
++	req_cp->chan = NULL;
++	req_cp->user_base = user_b;
++	req_cp->kernel_base = kernel_b;
++	req_cp->len  =  length;
++	req_cp->pages = NULL;
++	req_cp->nr_pages = 0 ;
++	req_cp->dma_cookie  = 0;
++	req_cp->status = DMA_INIT;
++}
++#endif /* CONFIG_POLICY_IOATDMA */
++
+ /**
+  * dma_async_issue_pending - flush pending transactions to HW
+  * @chan: target DMA channel
+@@ -1040,4 +1161,53 @@
+ 	struct dma_pinned_list *pinned_list, struct page *page,
+ 	unsigned int offset, size_t len);
+ 
++#ifdef CONFIG_POLICY_IOATDMA
++
++#define PIN_FAILED 0
++#define PIN_SUCCESSFUL 1
++#define PIN_NO_USER 2
++
++#define SET_DIRTY_ON 1
++#define SET_DIRTY_OFF 0
++
++#define PIN_WRITE 1
++#define PIN_READ 0
++
++struct dma_chan *copy_dma_get_channel_prio(unsigned short int priority);
++int start_policy_prio2(long nanosecs_high , long nanosecs_low);
++void stop_policy_prio(void);
++int __dma_copy_to_user_prio(struct request_copy_prio *req_cpy_local);
++int __dma_copy_from_user_prio(struct request_copy_prio *req_cpy_local);
++int _dma_copy_to_user_prio(struct request_copy_prio *req_cpy_local);
++int _dma_copy_from_user_prio(struct request_copy_prio *req_cpy_local);
++extern void ioat_suspend_chan(struct dma_chan *c);
++extern void ioat_resume_chan(struct dma_chan *c);
++int dma_pin_user_pages_prio(struct request_copy_prio *req_cp , int write , int force);
++void dma_unpin_user_pages_prio(struct request_copy_prio *req_cp , int dirty);
++
++
++struct dma_chan *copy_dma_get_channel_boot(void);
++int dma_pin_user_pages(struct request_copy *req_cp , int write , int force);
++void dma_unpin_user_pages(struct request_copy *req_cp , int dirty);
++int dma_copy_from_user(struct request_copy *req_cpy_local);
++int dma_copy_to_user(struct request_copy *req_cpy_local);
++int dma_copy_from_kernel(struct request_copy *req_cpy_local);
++int dma_copy_to_kernel(struct request_copy *req_cpy_local);
++
++struct dma_chan *copy_dma_get_channel_sh(void);
++int _dma_copy_from_user_sh(struct request_copy *req_cpy_local);
++int _dma_copy_to_user_sh(struct request_copy *req_cpy_local);
++void start_policy_sh(void);
++void stop_policy_sh(void);
++
++struct dma_chan *copy_dma_get_channel_excl(void);
++int _dma_copy_from_user_excl(struct request_copy *req_cpy_local);
++int _dma_copy_to_user_excl(struct request_copy *req_cpy_local);
++int start_policy_excl(void);
++void stop_policy_excl(void);
++#endif
++
++void copy_dmaengine_put(void);
++void copy_dmaengine_get(void);
++
+ #endif /* DMAENGINE_H */
+diff -NaubrB linux-3.9.2/init/boot_copy_dma_chan.c linux-3.9.2.2/init/boot_copy_dma_chan.c
+--- linux-3.9.2/init/boot_copy_dma_chan.c	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.2/init/boot_copy_dma_chan.c	2013-11-12 18:27:04.329168410 +0100
+@@ -0,0 +1,107 @@
++#include <linux/dmaengine.h>
++#include <linux/module.h>
++
++#ifdef CONFIG_EXCL_COPY_TO_FROM_IOATDMA
++#include <linux/percpu.h>
++
++DEFINE_PER_CPU(struct dma_chan_copy , percpu_chan_copy);
++EXPORT_PER_CPU_SYMBOL(percpu_chan_copy);
++
++/* relase exclusive channels */
++static void boot_release_dma_chan(void)
++{ 
++  uint i;
++	struct dma_chan_copy *cpu_chan;
++
++	for_each_present_cpu(i) 
++	{
++		cpu_chan = &per_cpu(percpu_chan_copy , i);
++		
++		if(cpu_chan->use == 1)
++		{
++			dma_release_channel(cpu_chan->chan);
++			cpu_chan->chan = NULL;
++			cpu_chan->use = 0;
++		} 
++	}
++}
++
++/* init available exclusive channels */
++void __init boot_init_dma_chan(void)
++{ 
++	uint i;
++	struct dma_chan_copy *cpu_chan;
++
++	for_each_present_cpu(i) 
++	{
++		cpu_chan = &per_cpu(percpu_chan_copy , i);
++		cpu_chan->use = 0;
++		cpu_chan->chan = NULL;
++	}
++}
++
++/* make available exclusive channels */
++void __init boot_complete_dma_chan(void)
++{
++	uint i;
++	dma_cap_mask_t mask;
++	struct dma_chan *chan;
++	struct dma_chan_copy *cpu_chan;
++	
++	dma_cap_zero(mask);
++	dma_cap_set(DMA_MEMCPY, mask);
++	
++	for_each_present_cpu(i) 
++	{
++		cpu_chan = &per_cpu(percpu_chan_copy , i);
++		chan = dma_request_channel(mask, NULL , NULL);
++
++		if(chan)
++		{
++			cpu_chan->use = 1;
++			cpu_chan->chan = chan;
++		} 
++		else
++		{
++			goto error_boot;
++		}
++	}
++	printk(KERN_DEBUG "ioat: DMA chan alloc (exclusive chan policy)\n");
++	
++	return;
++
++error_boot:
++	boot_release_dma_chan();
++	printk(KERN_WARNING "ioat: WARNING no DMA chan alloc (exclusive chan policy)\n");
++  return;
++}
++#endif
++
++#ifdef CONFIG_SHARED_COPY_TO_FROM_IOATDMA
++
++void __init boot_init_dma_chan(void)
++{
++	
++}
++/* make available shared channels */
++void __init boot_complete_dma_chan(void)
++{
++	copy_dmaengine_get();
++	printk(KERN_DEBUG "ioat: DMA chan alloc (shared chan policy)\n");
++}
++
++#endif
++
++#ifdef CONFIG_DYNAMIC_CHAN_POLICY_IOATDMA
++
++void __init boot_init_dma_chan(void)
++{
++
++}
++
++void __init boot_complete_dma_chan(void)
++{
++}
++#endif
++
++
+diff -NaubrB linux-3.9.2/init/boot_mem_micro-benchmark.c linux-3.9.2.2/init/boot_mem_micro-benchmark.c
+--- linux-3.9.2/init/boot_mem_micro-benchmark.c	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.2/init/boot_mem_micro-benchmark.c	2013-10-23 12:13:36.008117000 +0200
+@@ -0,0 +1,49 @@
++#include <linux/bootmem.h>
++#include <linux/module.h>
++
++char *boot_mem_microBenchmark;
++EXPORT_SYMBOL(boot_mem_microBenchmark);
++
++unsigned long size_boot_mem_mb;
++EXPORT_SYMBOL(size_boot_mem_mb);
++
++/* init kernel memory region at boot system */
++void __init boot_init_mem_mb(void)
++{
++#ifdef CONFIG_MEM_MICRO_BENCHMARK_32
++	size_boot_mem_mb = 33554432;	
++#endif
++
++#ifdef CONFIG_MEM_MICRO_BENCHMARK_64
++	size_boot_mem_mb = 67108864;
++#endif	
++
++#ifdef CONFIG_MEM_MICRO_BENCHMARK_128
++	size_boot_mem_mb = 134217728;
++#endif
++
++#ifdef CONFIG_MEM_MICRO_BENCHMARK_256
++	size_boot_mem_mb = 268435456;
++#endif
++
++#ifdef CONFIG_MEM_MICRO_BENCHMARK_512
++	size_boot_mem_mb = 536870912;
++#endif
++
++#ifdef CONFIG_MEM_MICRO_BENCHMARK_1024
++	size_boot_mem_mb = 1073741824;
++#endif
++
++	boot_mem_microBenchmark = alloc_bootmem(size_boot_mem_mb);
++	
++	if(!boot_mem_microBenchmark)
++	{
++		printk(KERN_WARNING "mem_mb: Error alloc_bootmem() of %lu byte !!!!\n" , size_boot_mem_mb);
++	}
++	else
++	{
++		printk(KERN_DEBUG "mem_mb: alloc_bootmem() of %lu byte \n" , size_boot_mem_mb);
++	}
++}
++
++
+diff -NaubrB linux-3.9.2/init/boot_trace_copy_tofrom.c linux-3.9.2.2/init/boot_trace_copy_tofrom.c
+--- linux-3.9.2/init/boot_trace_copy_tofrom.c	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.2/init/boot_trace_copy_tofrom.c	2013-10-31 13:23:49.177843000 +0100
+@@ -0,0 +1,35 @@
++#include <linux/circular_buffer.h>
++#include <linux/percpu.h>
++#include <linux/module.h>
++
++DEFINE_PER_CPU(struct CircularBuffer, mem_buff_to);
++EXPORT_PER_CPU_SYMBOL(mem_buff_to);
++
++DEFINE_PER_CPU(struct CircularBuffer, mem_buff_from);
++EXPORT_PER_CPU_SYMBOL(mem_buff_from);
++
++DEFINE_PER_CPU(struct CircularBuffer, __mem_buff_to);
++EXPORT_PER_CPU_SYMBOL(__mem_buff_to);
++
++DEFINE_PER_CPU(struct CircularBuffer, __mem_buff_from);
++EXPORT_PER_CPU_SYMBOL(__mem_buff_from);
++
++/* init trace for copy_to/from_user */
++void __init boot_init_trace_copy(void)
++{ 
++  uint i;
++  for_each_present_cpu(i) 
++  {
++		struct CircularBuffer *ptr = &per_cpu(mem_buff_to , i);
++		cbInit(ptr);
++		
++		ptr = &per_cpu(mem_buff_from , i);
++		cbInit(ptr);
++		
++		ptr = &per_cpu(__mem_buff_to , i);
++		cbInit(ptr);
++		
++		ptr = &per_cpu(__mem_buff_from , i);
++		cbInit(ptr);
++  }
++}
+diff -NaubrB linux-3.9.2/init/main.c linux-3.9.2.2/init/main.c
+--- linux-3.9.2/init/main.c	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/init/main.c	2013-10-31 13:00:59.225905000 +0100
+@@ -83,6 +83,19 @@
+ #include <asm/smp.h>
+ #endif
+ 
++#ifdef CONFIG_TRACE_COPY_TO_FROM_X86_64
++extern void boot_init_trace_copy(void);
++#endif
++
++#ifdef CONFIG_MEM_MICRO_BENCHMARK
++extern void  boot_init_mem_mb(void);
++#endif
++
++#ifdef CONFIG_POLICY_IOATDMA
++extern void boot_init_dma_chan(void);
++extern void boot_complete_dma_chan(void);
++#endif
++
+ static int kernel_init(void *);
+ 
+ extern void init_IRQ(void);
+@@ -502,6 +515,11 @@
+ 	mm_init_owner(&init_mm, &init_task);
+ 	mm_init_cpumask(&init_mm);
+ 	setup_command_line(command_line);
++		
++	#ifdef CONFIG_MEM_MICRO_BENCHMARK
++		boot_init_mem_mb();
++	#endif
++	
+ 	setup_nr_cpu_ids();
+ 	setup_per_cpu_areas();
+ 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
+@@ -641,6 +659,14 @@
+ 
+ 	ftrace_init();
+ 
++	#ifdef CONFIG_POLICY_IOATDMA
++		boot_init_dma_chan();
++	#endif
++	
++	#ifdef CONFIG_TRACE_COPY_TO_FROM_X86_64
++		boot_init_trace_copy();
++	#endif
++
+ 	/* Do the rest non-__init'ed, we're now alive */
+ 	rest_init();
+ }
+@@ -916,4 +942,8 @@
+ 
+ 	/* rootfs is available now, try loading default modules */
+ 	load_default_modules();
++	
++	#ifdef CONFIG_POLICY_IOATDMA
++		boot_complete_dma_chan();
++	#endif	
+ }
+diff -NaubrB linux-3.9.2/init/Makefile linux-3.9.2.2/init/Makefile
+--- linux-3.9.2/init/Makefile	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/init/Makefile	2013-10-21 11:57:20.683075000 +0200
+@@ -3,6 +3,11 @@
+ #
+ 
+ obj-y                          := main.o version.o mounts.o
++
++obj-$(CONFIG_POLICY_IOATDMA) += boot_copy_dma_chan.o
++obj-$(CONFIG_TRACE_COPY_TO_FROM_X86_64) += boot_trace_copy_tofrom.o
++obj-$(CONFIG_MEM_MICRO_BENCHMARK) += boot_mem_micro-benchmark.o
++
+ ifneq ($(CONFIG_BLK_DEV_INITRD),y)
+ obj-y                          += noinitramfs.o
+ else
+diff -NaubrB linux-3.9.2/kernel/circular_buffer.c linux-3.9.2.2/kernel/circular_buffer.c
+--- linux-3.9.2/kernel/circular_buffer.c	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.2/kernel/circular_buffer.c	2013-10-25 15:19:20.423682000 +0200
+@@ -0,0 +1,93 @@
++#include <linux/circular_buffer.h>
++#include <linux/module.h>
++
++/* alloc and init an instance of struct CircularBuffer */
++ void cbInit(struct CircularBuffer *cb )
++{
++	cb->size = CIRC_BUFF_SIZE;
++	cb->array_element =(struct unit_buff *) kzalloc(sizeof(struct unit_buff )* (cb->size) , GFP_KERNEL);
++	cb->start = 0;
++	cb->end   = 0;
++	cb->count_event = 0;
++}
++EXPORT_SYMBOL_GPL(cbInit);
++
++/* free an instance of struct CircularBuffer */
++void cbFree(struct CircularBuffer *cb) 
++{
++    kfree(cb->array_element); /* OK if null */ 
++}
++EXPORT_SYMBOL_GPL(cbFree);
++ 
++/* Write an element, not overwriting oldest element if buffer is full (wine policy).  */
++void cbWrite(struct CircularBuffer *cb, struct unit_buff *elem) 
++{
++	if( !cbIsFull(cb) )
++	{
++		memcpy(&(cb->array_element[cb->end]) , elem , sizeof(struct unit_buff));
++		mb();
++		cb->end = (cb->end + 1) % cb->size;
++	} /* full, no overwrite */
++}
++EXPORT_SYMBOL_GPL(cbWrite);
++
++/* Read oldest element and return a its copy. App must ensure !cbIsEmpty() first. */
++void cbRead(struct CircularBuffer *cb, struct unit_buff *elem) 
++{
++	memcpy(elem, &(cb->array_element[cb->start]) , sizeof(struct unit_buff));
++	mb();
++  cb->start = (cb->start + 1) % cb->size;
++}
++EXPORT_SYMBOL_GPL(cbRead);
++
++/* Read at most @size oldest element and returns the number of elements copied */
++int cbRead_list(struct CircularBuffer *cb, struct unit_buff *elem , int size) 
++{
++	int segment_1 = cb->end;
++	int segment_2 = 0;
++	
++	if(segment_1 == cb->start)
++		return 0;
++	
++	if(segment_1 < cb->start)
++	{		
++		segment_2 = segment_1;
++		segment_1 = cb->size - cb->start;
++		
++		if((segment_1+segment_2) > size )  
++		{
++			if(segment_1 > size)
++			{
++				segment_1 = size;
++				segment_2 = 0;
++			}
++			else
++			{
++				segment_2 = size - segment_1;
++			}
++		}
++	}
++	else
++	{
++		segment_1 = segment_1 - cb->start ;
++		
++		if(segment_1 > size )  
++			segment_1 = size;
++	}
++	
++	memcpy(elem, &(cb->array_element[cb->start]) , sizeof(struct unit_buff)*segment_1);
++	mb();
++  cb->start = (cb->start + segment_1) % cb->size;
++  mb();
++
++  if(segment_2)
++  {
++		memcpy(&(elem[segment_1]), &(cb->array_element[cb->start]) , sizeof(struct unit_buff)*segment_2);
++		mb();
++		cb->start = (cb->start + segment_2) % cb->size;
++	}
++  
++  return (segment_1 + segment_2);
++}
++EXPORT_SYMBOL_GPL(cbRead_list);
++
+diff -NaubrB linux-3.9.2/kernel/Makefile linux-3.9.2.2/kernel/Makefile
+--- linux-3.9.2/kernel/Makefile	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/kernel/Makefile	2013-10-15 12:34:31.469135000 +0200
+@@ -10,7 +10,7 @@
+ 	    kthread.o wait.o sys_ni.o posix-cpu-timers.o mutex.o \
+ 	    hrtimer.o rwsem.o nsproxy.o srcu.o semaphore.o \
+ 	    notifier.o ksysfs.o cred.o \
+-	    async.o range.o groups.o lglock.o smpboot.o
++	    async.o range.o groups.o lglock.o smpboot.o circular_buffer.o
+ 
+ ifdef CONFIG_FUNCTION_TRACER
+ # Do not trace debug files and internal ftrace files
+diff -NaubrB linux-3.9.2/kernel/module.c linux-3.9.2.2/kernel/module.c
+--- linux-3.9.2/kernel/module.c	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.2/kernel/module.c	2013-09-30 11:38:12.817836000 +0200
+@@ -2516,7 +2516,7 @@
+ 	if (!info->hdr)
+ 		return -ENOMEM;
+ 
+-	if (copy_from_user(info->hdr, umod, info->len) != 0) {
++	if (copy_from_user_pure(info->hdr, umod, info->len) != 0) {
+ 		vfree(info->hdr);
+ 		return -EFAULT;
+ 	}
+diff -NaubrB linux-3.9.2/scripts/mod/devicetable-offsets.h linux-3.9.2.2/scripts/mod/devicetable-offsets.h
+--- linux-3.9.2/scripts/mod/devicetable-offsets.h	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.2/scripts/mod/devicetable-offsets.h	2013-12-17 17:30:50.288935260 +0100
+@@ -0,0 +1,146 @@
++#ifndef __DEVICEVTABLE_OFFSETS_H__
++#define __DEVICEVTABLE_OFFSETS_H__
++/*
++ * DO NOT MODIFY.
++ *
++ * This file was generated by Kbuild
++ *
++ */
++
++#define SIZE_usb_device_id 32 /* sizeof(struct usb_device_id)	# */
++#define OFF_usb_device_id_match_flags 0 /* offsetof(struct usb_device_id, match_flags)	# */
++#define OFF_usb_device_id_idVendor 2 /* offsetof(struct usb_device_id, idVendor)	# */
++#define OFF_usb_device_id_idProduct 4 /* offsetof(struct usb_device_id, idProduct)	# */
++#define OFF_usb_device_id_bcdDevice_lo 6 /* offsetof(struct usb_device_id, bcdDevice_lo)	# */
++#define OFF_usb_device_id_bcdDevice_hi 8 /* offsetof(struct usb_device_id, bcdDevice_hi)	# */
++#define OFF_usb_device_id_bDeviceClass 10 /* offsetof(struct usb_device_id, bDeviceClass)	# */
++#define OFF_usb_device_id_bDeviceSubClass 11 /* offsetof(struct usb_device_id, bDeviceSubClass)	# */
++#define OFF_usb_device_id_bDeviceProtocol 12 /* offsetof(struct usb_device_id, bDeviceProtocol)	# */
++#define OFF_usb_device_id_bInterfaceClass 13 /* offsetof(struct usb_device_id, bInterfaceClass)	# */
++#define OFF_usb_device_id_bInterfaceSubClass 14 /* offsetof(struct usb_device_id, bInterfaceSubClass)	# */
++#define OFF_usb_device_id_bInterfaceProtocol 15 /* offsetof(struct usb_device_id, bInterfaceProtocol)	# */
++#define OFF_usb_device_id_bInterfaceNumber 16 /* offsetof(struct usb_device_id, bInterfaceNumber)	# */
++#define SIZE_hid_device_id 24 /* sizeof(struct hid_device_id)	# */
++#define OFF_hid_device_id_bus 0 /* offsetof(struct hid_device_id, bus)	# */
++#define OFF_hid_device_id_group 2 /* offsetof(struct hid_device_id, group)	# */
++#define OFF_hid_device_id_vendor 4 /* offsetof(struct hid_device_id, vendor)	# */
++#define OFF_hid_device_id_product 8 /* offsetof(struct hid_device_id, product)	# */
++#define SIZE_ieee1394_device_id 32 /* sizeof(struct ieee1394_device_id)	# */
++#define OFF_ieee1394_device_id_match_flags 0 /* offsetof(struct ieee1394_device_id, match_flags)	# */
++#define OFF_ieee1394_device_id_vendor_id 4 /* offsetof(struct ieee1394_device_id, vendor_id)	# */
++#define OFF_ieee1394_device_id_model_id 8 /* offsetof(struct ieee1394_device_id, model_id)	# */
++#define OFF_ieee1394_device_id_specifier_id 12 /* offsetof(struct ieee1394_device_id, specifier_id)	# */
++#define OFF_ieee1394_device_id_version 16 /* offsetof(struct ieee1394_device_id, version)	# */
++#define SIZE_pci_device_id 32 /* sizeof(struct pci_device_id)	# */
++#define OFF_pci_device_id_vendor 0 /* offsetof(struct pci_device_id, vendor)	# */
++#define OFF_pci_device_id_device 4 /* offsetof(struct pci_device_id, device)	# */
++#define OFF_pci_device_id_subvendor 8 /* offsetof(struct pci_device_id, subvendor)	# */
++#define OFF_pci_device_id_subdevice 12 /* offsetof(struct pci_device_id, subdevice)	# */
++#define OFF_pci_device_id_class 16 /* offsetof(struct pci_device_id, class)	# */
++#define OFF_pci_device_id_class_mask 20 /* offsetof(struct pci_device_id, class_mask)	# */
++#define SIZE_ccw_device_id 16 /* sizeof(struct ccw_device_id)	# */
++#define OFF_ccw_device_id_match_flags 0 /* offsetof(struct ccw_device_id, match_flags)	# */
++#define OFF_ccw_device_id_cu_type 2 /* offsetof(struct ccw_device_id, cu_type)	# */
++#define OFF_ccw_device_id_cu_model 6 /* offsetof(struct ccw_device_id, cu_model)	# */
++#define OFF_ccw_device_id_dev_type 4 /* offsetof(struct ccw_device_id, dev_type)	# */
++#define OFF_ccw_device_id_dev_model 7 /* offsetof(struct ccw_device_id, dev_model)	# */
++#define SIZE_ap_device_id 16 /* sizeof(struct ap_device_id)	# */
++#define OFF_ap_device_id_dev_type 2 /* offsetof(struct ap_device_id, dev_type)	# */
++#define SIZE_css_device_id 16 /* sizeof(struct css_device_id)	# */
++#define OFF_css_device_id_type 1 /* offsetof(struct css_device_id, type)	# */
++#define SIZE_serio_device_id 4 /* sizeof(struct serio_device_id)	# */
++#define OFF_serio_device_id_type 0 /* offsetof(struct serio_device_id, type)	# */
++#define OFF_serio_device_id_proto 3 /* offsetof(struct serio_device_id, proto)	# */
++#define OFF_serio_device_id_id 2 /* offsetof(struct serio_device_id, id)	# */
++#define OFF_serio_device_id_extra 1 /* offsetof(struct serio_device_id, extra)	# */
++#define SIZE_acpi_device_id 24 /* sizeof(struct acpi_device_id)	# */
++#define OFF_acpi_device_id_id 0 /* offsetof(struct acpi_device_id, id)	# */
++#define SIZE_pnp_device_id 16 /* sizeof(struct pnp_device_id)	# */
++#define OFF_pnp_device_id_id 0 /* offsetof(struct pnp_device_id, id)	# */
++#define SIZE_pnp_card_device_id 80 /* sizeof(struct pnp_card_device_id)	# */
++#define OFF_pnp_card_device_id_devs 16 /* offsetof(struct pnp_card_device_id, devs)	# */
++#define SIZE_pcmcia_device_id 80 /* sizeof(struct pcmcia_device_id)	# */
++#define OFF_pcmcia_device_id_match_flags 0 /* offsetof(struct pcmcia_device_id, match_flags)	# */
++#define OFF_pcmcia_device_id_manf_id 2 /* offsetof(struct pcmcia_device_id, manf_id)	# */
++#define OFF_pcmcia_device_id_card_id 4 /* offsetof(struct pcmcia_device_id, card_id)	# */
++#define OFF_pcmcia_device_id_func_id 6 /* offsetof(struct pcmcia_device_id, func_id)	# */
++#define OFF_pcmcia_device_id_function 7 /* offsetof(struct pcmcia_device_id, function)	# */
++#define OFF_pcmcia_device_id_device_no 8 /* offsetof(struct pcmcia_device_id, device_no)	# */
++#define OFF_pcmcia_device_id_prod_id_hash 12 /* offsetof(struct pcmcia_device_id, prod_id_hash)	# */
++#define SIZE_of_device_id 200 /* sizeof(struct of_device_id)	# */
++#define OFF_of_device_id_name 0 /* offsetof(struct of_device_id, name)	# */
++#define OFF_of_device_id_type 32 /* offsetof(struct of_device_id, type)	# */
++#define OFF_of_device_id_compatible 64 /* offsetof(struct of_device_id, compatible)	# */
++#define SIZE_vio_device_id 64 /* sizeof(struct vio_device_id)	# */
++#define OFF_vio_device_id_type 0 /* offsetof(struct vio_device_id, type)	# */
++#define OFF_vio_device_id_compat 32 /* offsetof(struct vio_device_id, compat)	# */
++#define SIZE_input_device_id 192 /* sizeof(struct input_device_id)	# */
++#define OFF_input_device_id_flags 0 /* offsetof(struct input_device_id, flags)	# */
++#define OFF_input_device_id_bustype 8 /* offsetof(struct input_device_id, bustype)	# */
++#define OFF_input_device_id_vendor 10 /* offsetof(struct input_device_id, vendor)	# */
++#define OFF_input_device_id_product 12 /* offsetof(struct input_device_id, product)	# */
++#define OFF_input_device_id_version 14 /* offsetof(struct input_device_id, version)	# */
++#define OFF_input_device_id_evbit 16 /* offsetof(struct input_device_id, evbit)	# */
++#define OFF_input_device_id_keybit 24 /* offsetof(struct input_device_id, keybit)	# */
++#define OFF_input_device_id_relbit 120 /* offsetof(struct input_device_id, relbit)	# */
++#define OFF_input_device_id_absbit 128 /* offsetof(struct input_device_id, absbit)	# */
++#define OFF_input_device_id_mscbit 136 /* offsetof(struct input_device_id, mscbit)	# */
++#define OFF_input_device_id_ledbit 144 /* offsetof(struct input_device_id, ledbit)	# */
++#define OFF_input_device_id_sndbit 152 /* offsetof(struct input_device_id, sndbit)	# */
++#define OFF_input_device_id_ffbit 160 /* offsetof(struct input_device_id, ffbit)	# */
++#define OFF_input_device_id_swbit 176 /* offsetof(struct input_device_id, swbit)	# */
++#define SIZE_eisa_device_id 16 /* sizeof(struct eisa_device_id)	# */
++#define OFF_eisa_device_id_sig 0 /* offsetof(struct eisa_device_id, sig)	# */
++#define SIZE_parisc_device_id 8 /* sizeof(struct parisc_device_id)	# */
++#define OFF_parisc_device_id_hw_type 0 /* offsetof(struct parisc_device_id, hw_type)	# */
++#define OFF_parisc_device_id_hversion 2 /* offsetof(struct parisc_device_id, hversion)	# */
++#define OFF_parisc_device_id_hversion_rev 1 /* offsetof(struct parisc_device_id, hversion_rev)	# */
++#define OFF_parisc_device_id_sversion 4 /* offsetof(struct parisc_device_id, sversion)	# */
++#define SIZE_sdio_device_id 16 /* sizeof(struct sdio_device_id)	# */
++#define OFF_sdio_device_id_class 0 /* offsetof(struct sdio_device_id, class)	# */
++#define OFF_sdio_device_id_vendor 2 /* offsetof(struct sdio_device_id, vendor)	# */
++#define OFF_sdio_device_id_device 4 /* offsetof(struct sdio_device_id, device)	# */
++#define SIZE_ssb_device_id 6 /* sizeof(struct ssb_device_id)	# */
++#define OFF_ssb_device_id_vendor 0 /* offsetof(struct ssb_device_id, vendor)	# */
++#define OFF_ssb_device_id_coreid 2 /* offsetof(struct ssb_device_id, coreid)	# */
++#define OFF_ssb_device_id_revision 4 /* offsetof(struct ssb_device_id, revision)	# */
++#define SIZE_bcma_device_id 6 /* sizeof(struct bcma_device_id)	# */
++#define OFF_bcma_device_id_manuf 0 /* offsetof(struct bcma_device_id, manuf)	# */
++#define OFF_bcma_device_id_id 2 /* offsetof(struct bcma_device_id, id)	# */
++#define OFF_bcma_device_id_rev 4 /* offsetof(struct bcma_device_id, rev)	# */
++#define OFF_bcma_device_id_class 5 /* offsetof(struct bcma_device_id, class)	# */
++#define SIZE_virtio_device_id 8 /* sizeof(struct virtio_device_id)	# */
++#define OFF_virtio_device_id_device 0 /* offsetof(struct virtio_device_id, device)	# */
++#define OFF_virtio_device_id_vendor 4 /* offsetof(struct virtio_device_id, vendor)	# */
++#define SIZE_hv_vmbus_device_id 24 /* sizeof(struct hv_vmbus_device_id)	# */
++#define OFF_hv_vmbus_device_id_guid 0 /* offsetof(struct hv_vmbus_device_id, guid)	# */
++#define SIZE_i2c_device_id 32 /* sizeof(struct i2c_device_id)	# */
++#define OFF_i2c_device_id_name 0 /* offsetof(struct i2c_device_id, name)	# */
++#define SIZE_spi_device_id 40 /* sizeof(struct spi_device_id)	# */
++#define OFF_spi_device_id_name 0 /* offsetof(struct spi_device_id, name)	# */
++#define SIZE_dmi_system_id 344 /* sizeof(struct dmi_system_id)	# */
++#define OFF_dmi_system_id_matches 16 /* offsetof(struct dmi_system_id, matches)	# */
++#define SIZE_platform_device_id 32 /* sizeof(struct platform_device_id)	# */
++#define OFF_platform_device_id_name 0 /* offsetof(struct platform_device_id, name)	# */
++#define SIZE_mdio_device_id 8 /* sizeof(struct mdio_device_id)	# */
++#define OFF_mdio_device_id_phy_id 0 /* offsetof(struct mdio_device_id, phy_id)	# */
++#define OFF_mdio_device_id_phy_id_mask 4 /* offsetof(struct mdio_device_id, phy_id_mask)	# */
++#define SIZE_zorro_device_id 16 /* sizeof(struct zorro_device_id)	# */
++#define OFF_zorro_device_id_id 0 /* offsetof(struct zorro_device_id, id)	# */
++#define SIZE_isapnp_device_id 16 /* sizeof(struct isapnp_device_id)	# */
++#define OFF_isapnp_device_id_vendor 4 /* offsetof(struct isapnp_device_id, vendor)	# */
++#define OFF_isapnp_device_id_function 6 /* offsetof(struct isapnp_device_id, function)	# */
++#define SIZE_ipack_device_id 12 /* sizeof(struct ipack_device_id)	# */
++#define OFF_ipack_device_id_format 0 /* offsetof(struct ipack_device_id, format)	# */
++#define OFF_ipack_device_id_vendor 4 /* offsetof(struct ipack_device_id, vendor)	# */
++#define OFF_ipack_device_id_device 8 /* offsetof(struct ipack_device_id, device)	# */
++#define SIZE_amba_id 16 /* sizeof(struct amba_id)	# */
++#define OFF_amba_id_id 0 /* offsetof(struct amba_id, id)	# */
++#define OFF_amba_id_mask 4 /* offsetof(struct amba_id, mask)	# */
++#define SIZE_x86_cpu_id 16 /* sizeof(struct x86_cpu_id)	# */
++#define OFF_x86_cpu_id_feature 6 /* offsetof(struct x86_cpu_id, feature)	# */
++#define OFF_x86_cpu_id_family 2 /* offsetof(struct x86_cpu_id, family)	# */
++#define OFF_x86_cpu_id_model 4 /* offsetof(struct x86_cpu_id, model)	# */
++#define OFF_x86_cpu_id_vendor 0 /* offsetof(struct x86_cpu_id, vendor)	# */
++
++#endif
+diff -NaubrB linux-3.9.2/security/tomoyo/builtin-policy.h linux-3.9.2.2/security/tomoyo/builtin-policy.h
+--- linux-3.9.2/security/tomoyo/builtin-policy.h	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.2/security/tomoyo/builtin-policy.h	2013-12-17 17:20:02.868964728 +0100
+@@ -0,0 +1,12 @@
++static char tomoyo_builtin_profile[] __initdata =
++"";
++static char tomoyo_builtin_exception_policy[] __initdata =
++"initialize_domain /sbin/modprobe from any\n"
++"initialize_domain /sbin/hotplug from any\n"
++"";
++static char tomoyo_builtin_domain_policy[] __initdata =
++"";
++static char tomoyo_builtin_manager[] __initdata =
++"";
++static char tomoyo_builtin_stat[] __initdata =
++"";
+diff -NaubrB linux-3.9.2/security/tomoyo/policy/exception_policy.conf linux-3.9.2.2/security/tomoyo/policy/exception_policy.conf
+--- linux-3.9.2/security/tomoyo/policy/exception_policy.conf	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.2/security/tomoyo/policy/exception_policy.conf	2013-12-17 17:19:44.832965548 +0100
+@@ -0,0 +1,2 @@
++initialize_domain /sbin/modprobe from any
++initialize_domain /sbin/hotplug from any

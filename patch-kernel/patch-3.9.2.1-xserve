@@ -1,0 +1,376 @@
+diff -Naubr linux-3.9.2/arch/x86/boot/compressed/vmlinux.lds.S linux-3.9.2.1/arch/x86/boot/compressed/vmlinux.lds.S
+--- linux-3.9.2/arch/x86/boot/compressed/vmlinux.lds.S	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.1/arch/x86/boot/compressed/vmlinux.lds.S	2013-09-09 13:15:58.542658000 +0200
+@@ -9,7 +9,7 @@
+ 
+ #ifdef CONFIG_X86_64
+ OUTPUT_ARCH(i386:x86-64)
+-ENTRY(startup_64)
++ENTRY(startup_32)
+ #else
+ OUTPUT_ARCH(i386)
+ ENTRY(startup_32)
+diff -Naubr linux-3.9.2/arch/x86/include/uapi/asm/e820.h linux-3.9.2.1/arch/x86/include/uapi/asm/e820.h
+--- linux-3.9.2/arch/x86/include/uapi/asm/e820.h	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.1/arch/x86/include/uapi/asm/e820.h	2013-09-09 16:48:54.262307000 +0200
+@@ -36,9 +36,13 @@
+ #define E820_RESERVED	2
+ #define E820_ACPI	3
+ #define E820_NVS	4
+-#define E820_UNUSABLE	5
+-
+ 
++#ifdef CONFIG_EFI_XSERVE
++	#define E820_EFI_EXEC_CODE 5	
++	#define E820_UNUSABLE	6
++#else
++	#define E820_UNUSABLE	5
++#endif
+ /*
+  * reserved RAM used by kernel itself
+  * if CONFIG_INTEL_TXT is enabled, memory of this type will be
+diff -Naubr linux-3.9.2/arch/x86/Kconfig linux-3.9.2.1/arch/x86/Kconfig
+--- linux-3.9.2/arch/x86/Kconfig	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.1/arch/x86/Kconfig	2013-09-09 15:05:17.194478000 +0200
+@@ -1546,6 +1546,23 @@
+ 
+ 	  If unsure, say Y.
+ 
++
++config EFI_XSERVE
++       bool "Boot from EFI on Apple Xserve"
++       depends on ACPI
++       default n
++       ---help---
++       This enables the kernel to boot on EFI platforms using
++       system configuration information passed to it from the firmware.
++       EFI runtime services are not supported. Moreover, the kernel still
++       relies on a correct BIOS e820 map being passed by the boot loader.
++
++       This option is currently only useful for booting Apple Xserve
++       (late 2006) systems.
++
++       If you are not sure, just say N.
++
++
+ config EFI
+ 	bool "EFI runtime service support"
+ 	depends on ACPI
+diff -Naubr linux-3.9.2/arch/x86/kernel/e820.c linux-3.9.2.1/arch/x86/kernel/e820.c
+--- linux-3.9.2/arch/x86/kernel/e820.c	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.1/arch/x86/kernel/e820.c	2013-09-09 17:24:50.742248000 +0200
+@@ -149,6 +149,11 @@
+ 	case E820_UNUSABLE:
+ 		printk(KERN_CONT "unusable");
+ 		break;
++#ifdef CONFIG_EFI_XSERVE
++		case E820_EFI_EXEC_CODE:
++		printk(KERN_CONT "EFI runtime services code");
++		break;
++#endif
+ 	default:
+ 		printk(KERN_CONT "type %u", type);
+ 		break;
+@@ -915,6 +920,9 @@
+ 	case E820_ACPI:	return "ACPI Tables";
+ 	case E820_NVS:	return "ACPI Non-volatile Storage";
+ 	case E820_UNUSABLE:	return "Unusable memory";
++#ifdef CONFIG_EFI_XSERVE
++	case E820_EFI_EXEC_CODE: return "EFI Runtime services code";
++#endif
+ 	default:	return "reserved";
+ 	}
+ }
+diff -Naubr linux-3.9.2/arch/x86/kernel/efi_xserve.c linux-3.9.2.1/arch/x86/kernel/efi_xserve.c
+--- linux-3.9.2/arch/x86/kernel/efi_xserve.c	1970-01-01 01:00:00.000000000 +0100
++++ linux-3.9.2.1/arch/x86/kernel/efi_xserve.c	2013-07-18 12:03:50.710595000 +0200
+@@ -0,0 +1,131 @@
++/*
++ * Extensible Firmware Interface
++ *
++ * Based on Extensible Firmware Interface Specification version 1.0
++ *
++ * Copyright (C) 1999 VA Linux Systems
++ * Copyright (C) 1999 Walt Drummond <drummond@valinux.com>
++ * Copyright (C) 1999-2002 Hewlett-Packard Co.
++ *     David Mosberger-Tang <davidm@hpl.hp.com>
++ *     Stephane Eranian <eranian@hpl.hp.com>
++ *
++ * Goutham Rao: <goutham.rao@intel.com>
++ *     Skip non-WB memory and ignore empty memory ranges.
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/mm.h>
++#include <linux/types.h>
++#include <linux/time.h>
++#include <linux/spinlock.h>
++#include <linux/bootmem.h>
++#include <linux/ioport.h>
++#include <linux/module.h>
++#include <linux/efi.h>
++#include <linux/kexec.h>
++
++#include <asm/setup.h>
++#include <asm/io.h>
++#include <asm/page.h>
++#include <asm/pgtable.h>
++#include <asm/processor.h>
++#include <asm/desc.h>
++#include <asm/tlbflush.h>
++
++#define PFX            "EFI: "
++
++struct efi efi;
++EXPORT_SYMBOL(efi);
++
++void __init efi_init(void)
++{
++       efi_config_table_t *config_tables;
++       efi_char16_t *c16;
++       char vendor[100] = "unknown";
++       unsigned long num_config_tables;
++       int i = 0;
++
++       memset(&efi, 0, sizeof(efi) );
++
++       efi.systab = __boot_va(boot_params.efi_info.efi_systab);
++       /*
++        * Verify the EFI Table
++        */
++       if (efi.systab == NULL)
++               printk(KERN_ERR PFX "Woah! Couldn't map the EFI system table.\n");
++       if (efi.systab->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
++               printk(KERN_ERR PFX "Woah! EFI system table signature incorrect\n");
++       if ((efi.systab->hdr.revision >> 16) == 0)
++               printk(KERN_ERR PFX "Warning: EFI system table version "
++                      "%d.%02d, expected 1.00 or greater\n",
++                      efi.systab->hdr.revision >> 16,
++                      efi.systab->hdr.revision & 0xffff);
++
++       /*
++        * Grab some details from the system table
++        */
++       num_config_tables = efi.systab->nr_tables;
++       config_tables = (efi_config_table_t *)__boot_va(efi.systab->tables);
++
++       /*
++        * Show what we know for posterity
++        */
++       c16 = (efi_char16_t *) __boot_va(efi.systab->fw_vendor);
++       if (c16) {
++               for (i = 0; i < (sizeof(vendor) - 1) && *c16; ++i)
++                       vendor[i] = *c16++;
++               vendor[i] = '\0';
++       } else
++               printk(KERN_ERR PFX "Could not map the firmware vendor!\n");
++
++       printk(KERN_INFO PFX "EFI v%u.%.02u by %s \n",
++              efi.systab->hdr.revision >> 16,
++              efi.systab->hdr.revision & 0xffff, vendor);
++
++       /*
++        * Let's see what config tables the firmware passed to us.
++        */
++       if (config_tables == NULL)
++               printk(KERN_ERR PFX "Could not map EFI Configuration Table!\n");
++
++
++       efi.mps        = EFI_INVALID_TABLE_ADDR;
++       efi.acpi       = EFI_INVALID_TABLE_ADDR;
++       efi.acpi20     = EFI_INVALID_TABLE_ADDR;
++       efi.smbios     = EFI_INVALID_TABLE_ADDR;
++       efi.sal_systab = EFI_INVALID_TABLE_ADDR;
++       efi.boot_info  = EFI_INVALID_TABLE_ADDR;
++       efi.hcdp       = EFI_INVALID_TABLE_ADDR;
++       efi.uga        = EFI_INVALID_TABLE_ADDR;
++
++       printk(KERN_INFO PFX "Configuration tables:");
++       for (i = 0; i < num_config_tables; i++) {
++               if (efi_guidcmp(config_tables[i].guid, MPS_TABLE_GUID) == 0) {
++                       efi.mps = config_tables[i].table;
++                       printk(" MPS=0x%x ", config_tables[i].table);
++               } else
++                   if (efi_guidcmp(config_tables[i].guid, ACPI_20_TABLE_GUID) == 0) {
++                       efi.acpi20 = config_tables[i].table;
++                       printk(" ACPI 2.0=0x%x ", config_tables[i].table);
++               } else
++                   if (efi_guidcmp(config_tables[i].guid, ACPI_TABLE_GUID) == 0) {
++                       efi.acpi = config_tables[i].table;
++                       printk(" ACPI=0x%x ", config_tables[i].table);
++               } else
++                   if (efi_guidcmp(config_tables[i].guid, SMBIOS_TABLE_GUID) == 0) {
++                       efi.smbios = config_tables[i].table;
++                       printk(" SMBIOS=0x%x ", config_tables[i].table);
++               } else
++                   if (efi_guidcmp(config_tables[i].guid, HCDP_TABLE_GUID) == 0) {
++                       efi.hcdp = config_tables[i].table;
++                       printk(" HCDP=0x%x ", config_tables[i].table);
++               } else
++                   if (efi_guidcmp(config_tables[i].guid, UGA_IO_PROTOCOL_GUID) == 0) {
++                       efi.uga = config_tables[i].table;
++                       printk(" UGA=0x%x ", config_tables[i].table);
++               }
++       }
++       printk("\n");
++}
++
+diff -Naubr linux-3.9.2/arch/x86/kernel/Makefile linux-3.9.2.1/arch/x86/kernel/Makefile
+--- linux-3.9.2/arch/x86/kernel/Makefile	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.1/arch/x86/kernel/Makefile	2013-09-09 15:08:24.026472000 +0200
+@@ -45,6 +45,7 @@
+ obj-$(CONFIG_STACKTRACE)	+= stacktrace.o
+ obj-y				+= cpu/
+ obj-y				+= acpi/
++obj-$(CONFIG_EFI_XSERVE)	+= efi_xserve.o
+ obj-y				+= reboot.o
+ obj-$(CONFIG_X86_MSR)		+= msr.o
+ obj-$(CONFIG_X86_CPUID)		+= cpuid.o
+diff -Naubr linux-3.9.2/arch/x86/kernel/setup.c linux-3.9.2.1/arch/x86/kernel/setup.c
+--- linux-3.9.2/arch/x86/kernel/setup.c	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.1/arch/x86/kernel/setup.c	2013-09-28 14:15:37.825595000 +0200
+@@ -998,6 +998,10 @@
+ 	if (efi_enabled(EFI_BOOT))
+ 		efi_init();
+ 
++#ifdef CONFIG_EFI_XSERVE
++	efi_init();
++#endif
++
+ 	dmi_scan_machine();
+ 
+ 	/*
+diff -Naubr linux-3.9.2/drivers/acpi/osl.c linux-3.9.2.1/drivers/acpi/osl.c
+--- linux-3.9.2/drivers/acpi/osl.c	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.1/drivers/acpi/osl.c	2013-09-28 16:11:09.661857457 +0200
+@@ -248,7 +248,12 @@
+ 	if (acpi_rsdp)
+ 		return acpi_rsdp;
+ #endif
+-
++#ifdef CONFIG_EFI_XSERVE
++	if (efi.acpi20 != EFI_INVALID_TABLE_ADDR)
++		return efi.acpi20;
++	else if (efi.acpi != EFI_INVALID_TABLE_ADDR)
++		return efi.acpi;
++#endif
+ 	if (efi_enabled(EFI_CONFIG_TABLES)) {
+ 		if (efi.acpi20 != EFI_INVALID_TABLE_ADDR)
+ 			return efi.acpi20;
+@@ -262,7 +267,20 @@
+ 	} else {
+ 		acpi_physical_address pa = 0;
+ 
++#ifdef CONFIG_EFI_XSERVE
++	if (efi.acpi20 != EFI_INVALID_TABLE_ADDR)
++	{
++		pa = efi.acpi20;
++		return_ACPI_STATUS(AE_OK);
++	}
++	else if (efi.acpi != EFI_INVALID_TABLE_ADDR)
++	{
++		pa =  efi.acpi;
++		return_ACPI_STATUS(AE_OK);
++	}
++#else
+ 		acpi_find_root_pointer(&pa);
++#endif
+ 		return pa;
+ 	}
+ }
+diff -Naubr linux-3.9.2/drivers/firmware/dmi_scan.c linux-3.9.2.1/drivers/firmware/dmi_scan.c
+--- linux-3.9.2/drivers/firmware/dmi_scan.c	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.1/drivers/firmware/dmi_scan.c	2013-09-09 19:07:35.856844000 +0200
+@@ -470,6 +470,21 @@
+ 	char __iomem *p, *q;
+ 	int rc;
+ 
++	#if CONFIG_EFI_XSERVE
++		if (efi.smbios != EFI_INVALID_TABLE_ADDR) {
++		p = dmi_ioremap(efi.smbios, 32);
++		if (p == NULL)
++			goto error;
++
++		rc = dmi_present(p + 0x10); /* offset of _DMI_ string */
++		dmi_iounmap(p, 32);
++		if (!rc) {
++			dmi_available = 1;
++			goto out;
++		}
++		}
++	#endif
++
+ 	if (efi_enabled(EFI_CONFIG_TABLES)) {
+ 		if (efi.smbios == EFI_INVALID_TABLE_ADDR)
+ 			goto error;
+diff -Naubr linux-3.9.2/include/linux/efi.h linux-3.9.2.1/include/linux/efi.h
+--- linux-3.9.2/include/linux/efi.h	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.1/include/linux/efi.h	2013-09-09 16:21:17.390352000 +0200
+@@ -389,6 +389,13 @@
+ #define EFI_FILE_SYSTEM_GUID \
+     EFI_GUID(  0x964e5b22, 0x6459, 0x11d2, 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b )
+ 
++
++#ifdef CONFIG_EFI_XSERVE
++typedef struct {
++	efi_guid_t guid;
++	u32 table;
++} efi_config_table_t;
++#else
+ typedef struct {
+ 	efi_guid_t guid;
+ 	u64 table;
+@@ -403,6 +410,8 @@
+ 	efi_guid_t guid;
+ 	unsigned long table;
+ } efi_config_table_t;
++#endif
++
+ 
+ #define EFI_SYSTEM_TABLE_SIGNATURE ((u64)0x5453595320494249ULL)
+ 
+@@ -413,6 +422,23 @@
+ #define EFI_1_10_SYSTEM_TABLE_REVISION  ((1 << 16) | (10))
+ #define EFI_1_02_SYSTEM_TABLE_REVISION  ((1 << 16) | (02))
+ 
++#ifdef CONFIG_EFI_XSERVE
++typedef struct {
++	efi_table_hdr_t hdr;
++	u32 fw_vendor;	/* physical addr of CHAR16 vendor string */
++	u32 fw_revision;
++	u32 con_in_handle;
++	u32 con_in;
++	u32 con_out_handle;
++	u32 con_out;
++	u32 stderr_handle;
++	u32 stderr;
++	u32 runtime;
++	u32 boottime;
++	u32 nr_tables;
++	u32 tables;
++} efi_system_table_t;
++#else
+ typedef struct {
+ 	efi_table_hdr_t hdr;
+ 	u64 fw_vendor;	/* physical addr of CHAR16 vendor string */
+@@ -462,6 +488,7 @@
+ 	unsigned long nr_tables;
+ 	unsigned long tables;
+ } efi_system_table_t;
++#endif
+ 
+ struct efi_memory_map {
+ 	void *phys_map;
+diff -Naubr linux-3.9.2/Makefile linux-3.9.2.1/Makefile
+--- linux-3.9.2/Makefile	2013-05-11 16:19:28.000000000 +0200
++++ linux-3.9.2.1/Makefile	2013-09-10 10:29:10.538620000 +0200
+@@ -1,7 +1,7 @@
+ VERSION = 3
+ PATCHLEVEL = 9
+ SUBLEVEL = 2
+-EXTRAVERSION =
++EXTRAVERSION =.1
+ NAME = Unicycling Gorilla
+ 
+ # *DOCUMENTATION*
