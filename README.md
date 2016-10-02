@@ -10,9 +10,9 @@ provides a set of policies used to manage the DMA channels. One of these policie
 used to manage the transfers of real-time applications, in fact it allows to assign exclusively the
 bus of the DMA engine, for a certain time interval, to the channels that handle high-priority tasks.
 Furthermore, to analyse the performance of a system that uses my extension I have developed a
-tool-set that allowed to:
-• study the behaviour of the memory copy functions used into the kernel;
-• analyse the execution time of data transfers performed by the CPU and DMA;
-• analyse the bandwidth of the system for data transfers executed by the CPU and DMA;
-• study the phenomenon of Cache Pollution.
+tool-set that allowed to:  <br />
+• study the behaviour of the memory copy functions used into the kernel;  <br />
+• analyse the execution time of data transfers performed by the CPU and DMA;  <br />
+• analyse the bandwidth of the system for data transfers executed by the CPU and DMA;  <br />
+• study the phenomenon of Cache Pollution. <br />
 
